@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
@@ -18,7 +19,14 @@ except ImportError:  # Let retrieval remain usable before optional setup is comp
     types = None
 
 
-DEFAULT_LLM_MODEL = "gemini-3.6-flash"
+# One shared model policy is used by Q&A and every intelligence feature.
+PRIMARY_GEMINI_MODEL = "gemini-3.7-flash"
+FALLBACK_GEMINI_MODEL = "gemini-3.6-flash"
+TRANSIENT_RETRY_DELAYS_SECONDS = (1.0, 2.0)
+API_LIMIT_MESSAGE = (
+    "AI generation is temporarily unavailable due to API limits. "
+    "Retrieved evidence remains available below."
+)
 TOP_K = 4
 INSUFFICIENT_EVIDENCE_MESSAGE = (
     "I could not find sufficient evidence in the indexed documents to answer "
@@ -107,23 +115,101 @@ def generate_structured_content(
     response_schema,
     max_output_tokens: int,
 ):
-    """Use the shared client and common safe error handling for structured output."""
+    """Generate structured output with bounded transient retry and quota failover."""
+    client = get_gemini_client()
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=0.1,
+        max_output_tokens=max_output_tokens,
+        response_mime_type="application/json",
+        response_schema=response_schema,
+    )
+
     try:
-        return get_gemini_client().models.generate_content(
-            model=DEFAULT_LLM_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.1,
-                max_output_tokens=max_output_tokens,
-                response_mime_type="application/json",
-                response_schema=response_schema,
-            ),
+        return _generate_with_transient_retry(
+            client, PRIMARY_GEMINI_MODEL, prompt, config
         )
-    except RAGServiceError:
-        raise
-    except Exception as error:
-        raise GeminiRequestError(_friendly_llm_error(error)) from error
+    except Exception as primary_error:
+        if not _is_quota_error(primary_error):
+            raise GeminiRequestError(_friendly_llm_error(primary_error)) from primary_error
+
+        # A quota-exhausted model is not retried. Switch models exactly once.
+        logger.warning(
+            "Gemini quota limit reached: model=%s action=try_fallback",
+            PRIMARY_GEMINI_MODEL,
+        )
+        try:
+            return _generate_with_transient_retry(
+                client, FALLBACK_GEMINI_MODEL, prompt, config
+            )
+        except Exception as fallback_error:
+            if _is_quota_error(fallback_error):
+                logger.warning(
+                    "Gemini quota limit reached: model=%s action=no_more_models",
+                    FALLBACK_GEMINI_MODEL,
+                )
+                raise GeminiRequestError(API_LIMIT_MESSAGE) from fallback_error
+            raise GeminiRequestError(_friendly_llm_error(fallback_error)) from fallback_error
+
+
+def _error_status_code(error: Exception) -> int | None:
+    """Extract an HTTP-like status code without exposing provider error text."""
+    for attribute in ("code", "status_code"):
+        value = getattr(error, attribute, None)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            match = re.search(r"\b(4\d\d|5\d\d)\b", str(value or ""))
+            if match:
+                return int(match.group(1))
+    return None
+
+
+def _is_quota_error(error: Exception) -> bool:
+    """Recognize Gemini quota/rate-limit failures across SDK error variants."""
+    if _error_status_code(error) == 429:
+        return True
+    classification = f"{type(error).__name__} {error}".lower()
+    return any(
+        marker in classification
+        for marker in ("resource_exhausted", "resource exhausted", "rate limit", "quota")
+    )
+
+
+def _is_transient_error(error: Exception) -> bool:
+    """Return whether retrying the same model is appropriate."""
+    status_code = _error_status_code(error)
+    if status_code is not None:
+        return status_code in {500, 502, 503, 504}
+    classification = f"{type(error).__name__} {error}".lower()
+    return any(
+        marker in classification
+        for marker in ("service unavailable", "temporarily unavailable", "unavailable")
+    )
+
+
+def _generate_with_transient_retry(client, model: str, prompt: str, config):
+    """Call one model, backing off only for transient service failures."""
+    for attempt in range(len(TRANSIENT_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
+        except Exception as error:
+            if _is_quota_error(error) or not _is_transient_error(error):
+                raise
+            if attempt >= len(TRANSIENT_RETRY_DELAYS_SECONDS):
+                raise
+            delay = TRANSIENT_RETRY_DELAYS_SECONDS[attempt]
+            logger.warning(
+                "Gemini transient failure: model=%s retry=%s delay_seconds=%.1f",
+                model,
+                attempt + 1,
+                delay,
+            )
+            time.sleep(delay)
 
 
 class StructuredResponseParseError(ValueError):
@@ -494,11 +580,11 @@ def build_verified_sources(
 def _friendly_llm_error(error: Exception) -> str:
     """Translate provider errors without exposing request or credential details."""
     error_name = type(error).__name__
-    status_code = getattr(error, "code", None)
+    status_code = _error_status_code(error)
     if error_name in {"ConnectTimeout", "ReadTimeout", "TimeoutException"}:
         return "The Gemini request timed out. Please try again."
-    if status_code == 429:
-        return "The Gemini API quota or rate limit was reached. Please try again later."
+    if _is_quota_error(error):
+        return API_LIMIT_MESSAGE
     if status_code in {400, 401, 403}:
         return "Gemini rejected the API key or request. Check GEMINI_API_KEY."
     if status_code == 404:

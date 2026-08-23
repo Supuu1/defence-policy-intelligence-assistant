@@ -97,8 +97,9 @@ pip install -r requirements.txt
 
 ## Gemini configuration
 
-The application uses Google's official `google-genai` SDK with the configured
-`gemini-3.6-flash` model. Create an API key in
+The application uses Google's official `google-genai` SDK with
+`gemini-3.7-flash` as the primary generation model and `gemini-3.6-flash` as a
+quota fallback. Create an API key in
 [Google AI Studio](https://aistudio.google.com/app/apikey), then copy the
 environment template and add the key locally:
 

@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.corpus_service import deduplicate_documents_by_content  # noqa: E402
 from src.document_processing import process_pdf  # noqa: E402
 from src.rag_service import (  # noqa: E402
+    API_LIMIT_MESSAGE,
     INSUFFICIENT_EVIDENCE_MESSAGE,
     _friendly_llm_error,
     _resolve_gemini_api_key,
@@ -37,7 +38,7 @@ def main():
     assert [item["filename"] for item in duplicates] == ["renamed-copy.pdf"]
     assert sum(len(item["chunks"]) for item in unique) == 2
 
-    assert "quota or rate limit" in _friendly_llm_error(ProviderError(429)).lower()
+    assert _friendly_llm_error(ProviderError(429)) == API_LIMIT_MESSAGE
     assert "api key" in _friendly_llm_error(ProviderError(401)).lower()
     assert "model" in _friendly_llm_error(ProviderError(404)).lower()
     assert "temporarily unavailable" in _friendly_llm_error(ProviderError(503)).lower()
