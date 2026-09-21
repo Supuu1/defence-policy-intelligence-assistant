@@ -359,7 +359,7 @@ st.markdown(
     """
     <div class="main-header">
         <div class="eyebrow">DOCUMENT INTELLIGENCE / POLICY ANALYSIS</div>
-        <div class="main-title">🛡️ Defence Policy Intelligence Assistant</div>
+        <div class="main-title">🛡️ Research Intelligence Assistant</div>
         <div class="main-subtitle">
             Secure workspace for inspecting and preparing policy documents for analysis
         </div>
