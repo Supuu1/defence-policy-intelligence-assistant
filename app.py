@@ -61,7 +61,7 @@ from src.timeline_service import extract_timeline_events
 
 
 st.set_page_config(
-    page_title="Defence Policy Document Intelligence Assistant",
+    page_title="Research Intelligence Assistant",
     page_icon="🛡️",
     layout="wide",
 )
