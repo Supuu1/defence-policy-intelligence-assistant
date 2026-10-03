@@ -499,30 +499,119 @@ is needed. If unavailable or encoding fails, lexical analysis is retained and
 the semantic coverage/status is reported. No paper text is sent to an embedding
 service.
 
+### Bibliography parsing and reference verification
+
+The integrity pipeline preserves native PDF text line order and original page
+numbers; OCR pages are marked for review. Repeated margin headers/footers and
+page-number lines are removed conservatively. A standalone bibliography heading
+must be followed by reference-shaped entries; body mentions, year patterns and
+table-of-contents headings do not establish a boundary. Headingless physics-style
+bibliographies require a dense run of validated surname/initial/year entry starts
+in the latter half of the document. This is a conservative structural heuristic,
+not universal layout recognition; unfamiliar layouts can remain undetected.
+
+Entries continue across lines and pages. Numbered and common author-year formats,
+including surname/initial/year physics references, are supported. Author lists,
+titles and years are bounded and validated. Missing/uncertain fields stay empty;
+**Unparsed reference** retains an excerpt and original pages, and is never sent
+to a metadata service. Citation mapping uses these corrected local identities.
+Verified DOI metadata, search candidates, unparsed entries, lookup failures and
+unchecked entries retain separate statuses. Markdown reference tables escape
+pipes/markup, collapse whitespace and cap cells at 96 characters; full source
+evidence appears outside tables.
+
+Crossref and Europe PMC retry HTTP 429/502/503/504 at most twice after the initial
+attempt, with exponential backoff and jitter. Retry-After seconds or dates are
+honored; waits above five seconds return an unavailable status instead of retrying
+early. Invalid requests are not retried. Successful metadata results are cached
+privately for the current upload; failed lookups are not cached as successes.
+The UI/report show checked/cached coverage, unparsed exclusions and the 25-entry
+metadata limit. This is metadata coverage, not internet-wide source coverage.
+
+### Free experimental local AI-writing assessment
+
+The default detector is
+[MayZhou/e5-small-lora-ai-generated-detector](https://huggingface.co/MayZhou/e5-small-lora-ai-generated-detector),
+pinned to revision `483fc4969592dc20e00e5130e7187b5dd25dbcc7`.
+Its model card declares MIT, 33.4M parameters, RAID and GPT-4o-mini rewritten-tweet
+training, and self-reported accuracy 89.0%, F1 0.887 and AUC 0.976 (the card also
+lists a separate RAID-test accuracy 0.939). These are published evaluation results,
+not accuracy guarantees on uploaded research papers. The
+[base model card](https://huggingface.co/intfloat/e5-small) supports English only;
+other/unknown languages receive no assessment. The detector card does not specify
+calibration or runtime RAM requirements. Academic writing, edited prose and
+unseen generators can cause false positives and false negatives.
+
+No subscription, API key or detector account is needed. The model files occupy
+about 134 MB; only public model files are downloaded to ignored
+`.cache/local-detector`. CPU-only lazy loading uses a single Streamlit cached
+resource and inference lock, safetensors, and `trust_remote_code=False`. Cached
+files are loaded offline first. Existing Torch/Transformers dependencies are
+reused; no LoRA runtime or extra inference provider is needed. Paper text and
+scores stay on the app server/session, and are never sent to Hugging Face or Gemini.
+Run/download reruns do not load duplicate models or resubmit papers.
+
+Each passage is measured using the actual fast tokenizer, including special
+tokens, with a 512-token total limit. Windows back off to whole-word boundaries;
+no text is silently truncated. Oversized words, passage limits and failed
+inference are recorded as skipped coverage. The default budget is 200 passages,
+configurable up to 1,000 in the UI. Native PDF page attribution is preserved.
+The actual label-1 **uncalibrated softmax classifier score** appears per passage;
+no averaged document probability or calibrated authorship claim is invented.
+The overall assessment is explicitly uncertain.
+
+Passages with score **≥ 0.8** are flagged by default. This is an application cutoff,
+not a validated academic-writing threshold, and can be adjusted in the UI.
+**Analyzed text flagged as potentially AI-generated** = unique flagged analyzed
+word-token positions / unique successfully analyzed word-token positions × 100.
+Overlapping/duplicate positions count once. Bibliography entries are excluded;
+coverage reports analyzed/total body words, skipped words/text, pages and excluded
+reference words. Unanalyzed text is never counted as human. This is not the actual
+percentage of AI used and is independent of source similarity. Errors yield no
+invented score or heuristic substitute.
+
+Optional top-level Streamlit Secrets or local `.env` defaults (neither required):
+
+```toml
+LOCAL_AI_THRESHOLD = "0.8"
+LOCAL_AI_MAX_PASSAGES = "200"
+```
+
+Invalid defaults produce an actionable warning and disclosed fallback defaults.
+Users can override both settings in the UI. Initial downloads require outbound
+HTTPS access to Hugging Face; prepopulate the pinned cache for offline hosting.
+
+Measured locally on macOS: the real CPU smoke test peaked at **673.3 MiB RSS**
+and took 28.13 seconds including first download/loading. An offline cached-file
+run took 4.2 seconds with 571.6 MiB peak for the short smoke test. The model card provides
+no RAM guarantee. [Streamlit's resource documentation](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app#resource-limits)
+lists approximately 690 MB–2.7 GB memory and up to two CPU cores, with limits
+subject to change. Standalone memory leaves little room at the minimum allocation;
+allow headroom for the existing embedding/index resources and concurrent sessions
+(target at least 1 GB, preferably more). Actual combined memory and Cloud allocation
+must be checked in deployment; this local measurement does not verify Cloud fitness.
+Memory, language, download and inference failures produce clear unavailable/partial
+coverage messages. There is no automatic switch to a paid API.
+
 ### Optional external services and consent
 
-No external service is contacted for this workflow until the user enables the
-specific consent checkbox and presses **Run Research Paper Integrity Analysis**.
-Metadata, open-access lookup and detector consent are independent and scoped to
-the current uploaded content. Merely enabling a checkbox sends nothing.
+Crossref, Europe PMC and optional GPTZero require their own explicit checkbox
+and the Run action. Enabling a checkbox sends nothing. Their consent is scoped
+to uploaded content. The local detector sends no paper contents externally;
+its initial model-file download is separate from external paper analysis.
 
 | Service | What is sent with consent | Requirement | Scope |
 | --- | --- | --- | --- |
-| Crossref | Reference DOIs, or up to 1,000 characters of each bibliography entry | No API key | First 25 bibliography entries; exact DOI retrieval or unverified bibliographic candidates |
-| Europe PMC | Verified bibliography DOI identifiers | No API key; also requires Crossref consent | Up to five open-access sources, within the ten-source comparison limit |
-| GPTZero | Submitted non-bibliography body text; configured model/version | `GPTZERO_API_KEY`, `GPTZERO_MODEL_VERSION`, `GPTZERO_MAX_CHARACTERS` | Optional paid/external detector; no automatic retry or provider substitution |
+| Crossref | Reference DOIs or up to 1,000 characters per validated entry | No API key | First 25 entries; DOI verification or unverified candidates |
+| Europe PMC | Verified bibliography DOI identifiers | No API key; Crossref consent | Up to five OA sources within the ten-source limit |
+| GPTZero | Non-bibliography text excerpt | Optional API subscription/settings | Only when explicitly selected and consented; never required for local detection |
 
-The adapters were checked against the official
-[Crossref REST API documentation](https://github.com/CrossRef/rest-api-doc),
-[Crossref access documentation](https://www.crossref.org/documentation/retrieve-metadata/rest-api/access-and-authentication/),
-[Europe PMC REST service documentation](https://europepmc.org/RestfulWebService),
-and [Europe PMC open-access subset](https://europepmc.org/downloads/openaccess).
-Only Europe PMC records marked open access with an exact matching DOI and a
-PMCID are fetched through its `fullTextXML` endpoint. There is no arbitrary-URL
-fetching, publisher scraping or paywall bypass. Full-text XML has no PDF page
-numbers, so page references are reported as unavailable. HTTP timeouts, rate
-limits, inaccessible records, oversized responses, malformed XML/JSON and
-unsupported entities become coverage statuses; no source or passage is inferred.
+The adapters follow the official
+[Crossref REST documentation](https://github.com/CrossRef/rest-api-doc),
+[Europe PMC REST documentation](https://europepmc.org/RestfulWebService),
+and [open-access subset](https://europepmc.org/downloads/openaccess).
+Only exact DOI-matched, open-access Europe PMC records with PMCIDs are fetched;
+no arbitrary-URL scraping or paywall bypass. XML full text has no PDF page numbers.
 
 For optional GPTZero, put these **top-level** settings in Streamlit Secrets or
 local environment variables (environment values take precedence):
@@ -576,51 +665,50 @@ submission attempts are recorded because text may already have reached GPTZero.
 Local observations are separate and are not detector evidence. False positives,
 language, genre, editing and distribution shift limit all assessments.
 
-### GPTZero account and deployment
+### Optional GPTZero and deployment
 
-The [official setup guide](https://support.gptzero.me/articles/5840144813-how-can-i-get-the-api-and-request-code-samples)
-requires an account, an API subscription and an API key from the API dashboard.
-Confirm current pricing, quota, supported version and input allowance in that
-account; no price or dashboard-subscription entitlement is assumed. The provider
-also offers [limited free trials in its API docs](https://support.gptzero.me/articles/7472477101-can-i-try-the-api-for-free),
-which do not replace this app's authenticated integration.
+GPTZero remains available only through the explicitly selected external backend
+and consent gate. Its [official setup guide](https://support.gptzero.me/articles/5840144813-how-can-i-get-the-api-and-request-code-samples)
+requires an API subscription/key. Its version and input limit must be confirmed
+in that account; local operation requires none of these settings.
 
-On Streamlit Cloud: deploy these changes on the configured main branch, add the
-three top-level settings above under **App settings → Secrets**, then reboot the
-app. Locally use the same names in `.env` and run `streamlit run app.py`. Environment
-values take precedence. No new dependency or Gemini setting is required. Upload
-a permissioned paper, explicitly select detector consent, and run the analysis.
-Inspect coverage before interpreting either metric. The downloaded Markdown report
-contains verdicts, provider/version, genuine passages, coverage and methodology.
+Push the tested changes to the deployed `main` branch. Streamlit Cloud reinstalls
+changed requirements; reboot through **Manage app → Reboot app** if needed.
+Use **Local CPU (free)** (default), choose English, set threshold/coverage budget,
+and press Run. No Gemini settings need changing. The first local detection may
+pause while downloading model files. Review memory logs and coverage before use.
+No deployed detector success is claimed until that app is exercised.
 
-### Verification for this feature
-
-Offline focused checks:
+### Verification
 
 ```bash
+python tests/bibliography.py
+python tests/local_ai_writing.py
 python tests/ai_writing.py
 python tests/research_integrity.py
 python tests/integrity_ui.py
+python scripts/check_local_detector.py  # Real CPU inference; downloads public files if needed
+python scripts/check_steane_bibliography.py /path/to/public-steane.pdf
 ```
 
-Locally verified on 2026-10-03: 11 detector tests, 23 integrity service tests and five Streamlit workflow tests
-cover citation mapping, missing/ambiguous references, bibliography exclusion,
-quoted overlap, duplicate/overlapping positions, percentage denominator,
-cross-page attribution, inaccessible sources, semantic-score separation,
-malformed detector scores, consent gates, rerun duplication, new-upload consent
-reset, report creation, and clearing private state. Full-app startup/rerun and
-existing Gemini summary/client/parsing/token-budget regression checks passed.
-The cached MiniLM model loaded and produced 384-dimensional embeddings without
-network access.
+Real local inference succeeded using the pinned model and synthetic non-private
+text; a 1,540-word fixture used four passages, at most 512 tokens each, with 100%
+word coverage and one cached resource. 62 detector/integrity tests and 16 summary
+regressions passed, plus shared-client, response parsing, token budgeting, report
+export, production checks, full Streamlit startup/rerun, compilation and diff checks. Offline tests use mocked scores for token splitting, word unions, failure
+coverage, reports, consent and rerun behavior; they do not establish detector
+accuracy. Existing Gemini summary/client/parsing/token-budget and report checks
+are also run before deployment.
 
-Live verified: Crossref resolved the public fixture DOI
-`10.1371/journal.pone.0000308`, and Europe PMC returned readable open-access
-article body XML for that same DOI. Only this public identifier was sent; no
-uploaded paper or private bibliography was used in live validation. GPTZero was
-verified against its official documentation and mocked responses, **not live
-credentials**. Its account/version compatibility still requires a configured key,
-account-confirmed per-request limit, explicit user consent and deployment validation.
-No GPTZERO_API_KEY, GPTZERO_MODEL_VERSION or GPTZERO_MAX_CHARACTERS was available
-in the local settings during this update; no authenticated GPTZero call was made.
-No deployed app was modified.
-The existing Gemini model settings and summary code remain unchanged.
+A real public regression used Andrew Steane's *Quantum Computing*,
+[arXiv quant-ph/9708022](https://arxiv.org/abs/quant-ph/9708022): 65 pages, 137
+reference entries on pages 43–50; 121 parsed and 16 explicitly unparsed; 149
+citation markers mapped; maximum parsed author-field length 32 characters, with
+no body headings in author fields. The original uploaded PDF/faulty report was
+not available locally, so this public edition is not confirmed identical to it.
+The PDF is kept outside Git. Structural parsing and fields still require human
+review; no external metadata verification of these entries is claimed.
+
+Earlier public Crossref/Europe PMC fixture checks succeeded. GPTZero remains
+mock-tested/documentation-checked without live credentials. This update verifies
+local behavior, not Streamlit Cloud memory, downloads or deployed inference.

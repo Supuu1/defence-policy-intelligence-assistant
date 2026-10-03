@@ -76,3 +76,18 @@ def build_markdown_report(
         ]
     )
     return "\n".join(lines)
+
+
+def table_cell(value, limit=96):
+    """Short literal Markdown table cells; long evidence belongs outside tables."""
+    import re
+    text=' '.join(str(value if value is not None else '').split())
+    if len(text)>limit:text=text[:limit-1]+'…'
+    return re.sub(r'([\\|`*_\[\]<>])',r'\\\1',text)
+
+
+def markdown_table(columns, rows):
+    lines=['| '+' | '.join(table_cell(c) for c in columns)+' |',
+           '| '+' | '.join('---' for _ in columns)+' |']
+    lines.extend('| '+' | '.join(table_cell(value) for value in row)+' |' for row in rows)
+    return '\n'.join(lines)

@@ -16,7 +16,7 @@ NEAR_EXACT_THRESHOLD = .88
 SEMANTIC_THRESHOLD = .82
 WORD = re.compile(r"\b\w+(?:['’\-]\w+)*\b", re.UNICODE)
 DOI = re.compile(r"\b10\.\d{4,9}/[^\s<>\"]+", re.I)
-YEAR = re.compile(r"\b((?:19|20)\d{2}[a-z]?)\b")
+YEAR = re.compile(r"\b((?:18|19|20)\d{2}[a-z]?)\b")
 METHOD = (
     "Similarity within checked sources: union of submitted word-token positions "
     "identical in exact or near-exact matches / examined non-bibliography word tokens × 100. "
@@ -84,70 +84,25 @@ def pages_at(paper, start, end):
 
 def paper_from_pages(name, pages, digest=None):
     """Find bibliography headings conservatively; retain body/page offset mapping."""
-    body_parts, spans, reference_lines, notes = [], [], [], []
-    in_refs, found, cursor = False, False, 0
-    for page in pages:
-        text = page.get('text', '') or ''
-        number = page.get('page_number')
-        if not text.strip():
-            notes.append(f"Page {number}: no readable text extracted")
-        if page.get('extraction_method') == 'OCR':
-            notes.append(f"Page {number}: OCR text; verify citations and punctuation")
-        for line in text.splitlines(keepends=True):
-            if re.fullmatch(r'\s*(?:\d+[. ]+)?(?:references(?: and notes)?|bibliography|works cited|literature cited|reference list)\s*\n?', line, re.I):
-                in_refs, found = True, True
-                continue
-            if in_refs and re.match(r'^\s*(?:appendix\b|appendices\b|supplementary (?:material|information)\b)', line, re.I):
-                in_refs = False
-            if in_refs:
-                reference_lines.append((line.strip(), number))
-            else:
-                body_parts.append(line)
-                spans.append((cursor, cursor + len(line), number))
-                cursor += len(line)
-        body_parts.append('\n')
-        spans.append((cursor, cursor + 1, number))
-        cursor += 1
-    entries, current, ref_pages, label = [], [], [], None
-    def flush():
-        if not current:
-            return
-        raw = ' '.join(current).strip()
-        year_match = YEAR.search(raw)
-        year = year_match.group(1) if year_match else ''
-        prefix = raw[:year_match.start()] if year_match else raw
-        surname = re.search(r"\b([A-ZÀ-ÖØ-Þ][\w’'\-]+)\s*(?:,|\bet al\b|\band\b|&)", prefix)
-        if not surname:
-            surname = re.match(r"([A-ZÀ-ÖØ-Þ][\w’'\-]+)\b", prefix)
-        # Title inference is marked parsed/unverified, never scholarly verification.
-        tail = raw[year_match.end():].lstrip(')., :') if year_match else ''
-        title = re.split(r'\.\s|https?://|doi:', tail, maxsplit=1, flags=re.I)[0].strip() if tail else ''
-        dois = extract_dois(raw)
-        entries.append(dict(id=f'R{len(entries)+1}', label=label, raw=raw,
-                            pages=list(dict.fromkeys(ref_pages)), year=year,
-                            surname=surname.group(1).casefold() if surname else '',
-                            title=title, authors=prefix.strip(' (,.'), doi=dois[0] if dois else '',
+    from src.bibliography import bibliography_layout, parse_entries
+    body_lines,reference_lines,found,removed=bibliography_layout(pages)
+    parts=[];spans=[];cursor=0;notes=[]
+    for line,number in body_lines:
+        parts.append(line);spans.append((cursor,cursor+len(line),number));cursor+=len(line)
+    entries=[]
+    for entry in parse_entries(reference_lines):
+        dois=extract_dois(entry['raw'])
+        entries.append(dict(entry,id=f'R{len(entries)+1}',doi=dois[0] if dois else '',
                             link=doi_link(dois[0]) if dois else '',
-                            verification_status='Parsed from bibliography; not externally verified',
-                            origin='Author bibliography', cited=False))
-    for line, page in reference_lines:
-        numbered = re.match(r'^\s*(?:\[(\d+)\]|(\d+)\.)\s*(.*)', line)
-        author_start = re.match(r"^[A-ZÀ-ÖØ-Þ][\w’'\-]+,\s*[A-Z]", line)
-        if numbered or (author_start and current) or (not line and current):
-            flush()
-            current, ref_pages, label = [], [], None
-        if numbered:
-            label = int(numbered.group(1) or numbered.group(2))
-            line = numbered.group(3)
-        if line:
-            current.append(line)
-            ref_pages.append(page)
-    flush()
-    if not found:
-        notes.append('No supported bibliography heading found; bibliography exclusion and citation mapping may be incomplete')
-    body = ''.join(body_parts)
-    digest = digest or hashlib.sha256(('\n'.join(p.get('text', '') or '' for p in pages)).encode()).hexdigest()
-    return Paper(name, digest, pages, body, spans, entries, found, notes)
+                            verification_status=('Parsed from bibliography; not externally verified' if entry['lookup_eligible'] else 'Unparsed reference — not submitted for metadata lookup'),
+                            origin='Author bibliography',cited=False))
+    if removed:notes.append(f'Removed {removed} repeated margin header/footer or page-number lines.')
+    if not found:notes.append('No structurally supported bibliography heading found; bibliography exclusion and citation mapping may be incomplete')
+    for page in pages:
+        if not page.get('text','').strip():notes.append(f"Page {page.get('page_number')}: no readable text extracted")
+        if page.get('extraction_method')=='OCR':notes.append(f"Page {page.get('page_number')}: OCR text; verify citations and punctuation")
+    digest=digest or hashlib.sha256(('\n'.join(p.get('text','') or '' for p in pages)).encode()).hexdigest()
+    return Paper(name,digest,pages,''.join(parts),spans,entries,found,notes)
 
 
 def extract_pdf(data, name):
@@ -203,7 +158,7 @@ def citation_analysis(paper):
                 labels.append(int(limits[0]))
         for label in dict.fromkeys(labels):
             add(f'[{label}]',match.start(),match.end(),[r for r in refs if r['label']==label], 'numeric')
-    pattern = r"\b([A-ZÀ-ÖØ-Þ][\w’'\-]+)(?:\s+et\s+al\.?)?(?:\s+(?:and|&)\s+[A-ZÀ-ÖØ-Þ][\w’'\-]+)?\s*,?\s*\(?((?:19|20)\d{2}[a-z]?)\)?"
+    pattern = r"\b([A-ZÀ-ÖØ-Þ][\w’'\-]+)(?:\s+et\s+al\.?)?(?:\s+(?:and|&)\s+[A-ZÀ-ÖØ-Þ][\w’'\-]+)?\s*,?\s*\(?((?:18|19|20)\d{2}[a-z]?)\)?"
     for match in re.finditer(pattern,paper.body):
         surname, year = match.group(1).casefold(), match.group(2)
         prefix=paper.body[:match.start()]
@@ -417,9 +372,16 @@ def integrity_report(paper,citations,analysis,ai):
     lines=['# Research Paper Integrity Analysis','',f'Paper: {paper.name}',
            '', '## Source and citation analysis','',
            'Author bibliography and in-text citations are distinct from sources checked/discovered through text matching.']
+    from src.report_service import markdown_table
+    from src.scholarly_sources import MAX_METADATA_REFERENCES
+    lines.extend(['',markdown_table(['Reference','Authors','Title','Year','Status','Pages'],
+        [(r['id'],r.get('authors') or 'Unparsed reference',r.get('title') or r.get('excerpt','Unparsed reference'),
+          r.get('year',''),r['verification_status'],r['pages']) for r in paper.bibliography]),
+        '', '### Bibliography evidence (outside the compact table)',
+        f"Metadata checked or cached: {sum(bool(r.get('metadata_lookup_attempted')) for r in paper.bibliography)} / {len(paper.bibliography)} entries; configured lookup limit: {MAX_METADATA_REFERENCES}. Unparsed entries are not submitted."])
     for ref in paper.bibliography:
         lines.extend(['',f"### {ref['id']} — {ref.get('title') or 'Title unparsed'}",
-                      f"Authors: {ref.get('authors') or 'Unparsed'}; year: {ref.get('year') or 'Unparsed'}",
+                      f"Authors: {ref.get('authors') or 'Unparsed'}; year: {ref.get('year') or 'Unparsed'}; parsing: {ref.get('parse_status','Not recorded')}",
                       f"Origin: {ref['origin']}; explicitly cited: {ref['cited']}; status: {ref['verification_status']}",
                       f"DOI: {ref.get('doi') or 'Not available'}; link: {safe_link(ref.get('link','')) or 'Not available'}",
                       f"Bibliography pages: {ref['pages']}",literal(ref['raw'])])
@@ -443,7 +405,17 @@ def integrity_report(paper,citations,analysis,ai):
                       f"Similarity ({'cosine; not overlap' if m['match_type']=='semantic similarity' else 'token sequence ratio'}): {m['similarity']}",
                       'Submitted passage:',literal(m['submitted_passage']),'Matching source passage:',literal(m['source_passage'])])
     lines.extend(['','## AI-writing assessment','',ai['status'],ai.get('explanation','')])
-    if ai.get('provider'):
+    if ai.get('local_detector'):
+        import json
+        lines.extend([f"Model: {ai['model']}; revision: {ai['version']}; license: {ai['license']}; device: CPU",
+                      ai['assessment'],ai.get('error',''),
+                      f"Analyzed text flagged as potentially AI-generated: {str(ai['flagged_percentage'])+'%' if ai.get('flagged_percentage') is not None else 'Unavailable'}",
+                      f"Unique flagged words: {ai['flagged_words']}; analyzed words: {ai['analyzed_words']}; score threshold: {ai['threshold']}",
+                      'Coverage (including skipped words and excluded bibliography):',literal(json.dumps(ai['coverage'])),
+                      ai['method'],f"Model card: {ai['documentation']}",
+                      'Passage classifier scores and source text:',literal(json.dumps(ai['sentences'],ensure_ascii=False)),
+                      'Skipped text reasons and offsets:',literal(json.dumps(ai.get('skipped',[])))])
+    elif ai.get('provider'):
         import json
         lines.extend([f"Provider: {ai['provider']}; requested model/version: {ai['requested_version']}; reported version: {ai['reported_version']}",
                       f"Document classification: {ai['classification']}",

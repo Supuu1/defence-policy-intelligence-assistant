@@ -7,6 +7,7 @@ from src.research_integrity import (
     LIMITATIONS, METHOD, MAX_SOURCES,
 )
 from src.scholarly_sources import resolve_reference, retrieve_open_access, MAX_METADATA_REFERENCES
+from src.local_ai_writing import assess_local_writing, MODEL, REVISION, local_defaults
 from src.ai_writing import assess_writing, detector_settings, input_limit, highlighted_passage
 
 
@@ -69,23 +70,32 @@ def render_integrity_analysis():
     st.markdown('#### Optional external services — explicit consent')
     metadata_consent=st.checkbox('I consent to sending reference DOIs and up to 1,000 characters per bibliography entry to Crossref for metadata lookup (maximum 25 entries).',key=f'integrity-metadata-consent-{scope}')
     fulltext_consent=st.checkbox('I consent to sending verified reference DOI identifiers to Europe PMC to retrieve available open-access full text (maximum 5 sources). No paper body or passages are sent.',key=f'integrity-fulltext-consent-{scope}')
+    st.markdown('#### AI-writing detector')
+    defaults=local_defaults()
+    for warning in defaults['warnings']:st.warning(warning)
+    detector_backend=st.selectbox('AI-writing assessment method',['Local CPU (free)','GPTZero (optional external)'],key=f'integrity-detector-backend-{scope}')
+    local_enabled=st.checkbox('Run experimental local AI-writing assessment',value=True,key=f'integrity-local-enabled-{scope}')
+    language=st.selectbox('Paper language for local assessment',['English','Other / unknown'],key=f'integrity-local-language-{scope}')
+    threshold=st.number_input('Local classifier flag threshold',min_value=0.01,max_value=0.99,value=defaults['threshold'],step=0.05,key=f'integrity-local-threshold-{scope}',help='Application threshold for uncalibrated label-1 softmax score; not a validated academic-writing cutoff.')
+    max_passages=st.number_input('Maximum local passages to analyze',min_value=1,max_value=1000,value=defaults['max_passages'],step=10,key=f'integrity-local-limit-{scope}')
+    st.caption(f'Free CPU detector: {MODEL} · revision {REVISION[:12]}. No key or subscription. Paper text stays on this server; first use downloads public model files (~134 MB). English only, experimental, not calibrated for research papers.')
     settings=detector_settings()
     configured=bool(settings.get('GPTZERO_API_KEY') and settings.get('GPTZERO_MODEL_VERSION'))
     detector_consent=st.checkbox('I consent to sending this paper’s non-bibliography text to GPTZero for the configured external AI-writing assessment.',
-                                 key=f'integrity-detector-consent-{scope}',disabled=not configured)
+                                 key=f'integrity-detector-consent-{scope}',disabled=not configured or detector_backend!='GPTZero (optional external)')
     if not configured:
-        st.caption('AI authorship assessment unavailable: no supported detector key and explicit model/version configured. Local writing observations remain available.')
+        st.caption('Optional GPTZero is not configured. The free local detector requires no GPTZero settings.')
     else:
         st.caption(f"Configured detector: GPTZero · requested model/version: {settings['GPTZERO_MODEL_VERSION']}. This may consume your provider quota; probability is not a percentage written by AI.")
     limit=input_limit(settings)
-    if configured and limit:
+    if configured and limit and detector_backend=='GPTZero (optional external)':
         st.caption(f'Detector will receive at most the first {limit:,} non-bibliography characters in one request. Longer papers receive a partial assessment; scores are never averaged across chunks.')
-    elif configured:
+    elif configured and detector_backend=='GPTZero (optional external)':
         st.warning('Set GPTZERO_MAX_CHARACTERS to your account-confirmed API request limit before detection can run.')
     if fulltext_consent and not metadata_consent:
         st.info('Europe PMC comparison also requires Crossref metadata consent so exact reference DOIs can be verified first.')
     options=dict(associations=associations,semantic=semantic,metadata=metadata_consent,
-                 fulltext=fulltext_consent,detector=detector_consent,detector_version=settings.get('GPTZERO_MODEL_VERSION',''),
+                 fulltext=fulltext_consent,detector=detector_consent,detector_version=settings.get('GPTZERO_MODEL_VERSION',''),backend=detector_backend,local_enabled=local_enabled,local_language=language,local_threshold=threshold,local_limit=int(max_passages),local_version=REVISION,
                  detector_limit=settings.get('GPTZERO_MAX_CHARACTERS',''),
                  detector_credentials=hashlib.sha256(settings.get('GPTZERO_API_KEY','').encode()).hexdigest())
     result_key=hashlib.sha256(json.dumps(options,sort_keys=True).encode()).hexdigest()
@@ -118,7 +128,7 @@ def render_integrity_analysis():
                     for i,entry in enumerate(references):
                         if i<MAX_METADATA_REFERENCES:
                             status.update(label=f'Crossref metadata {i+1} / {min(len(references),MAX_METADATA_REFERENCES)}')
-                            references[i]=resolve_reference(entry,consent=True)
+                            references[i]=resolve_reference(entry,consent=True,cache=state.setdefault('metadata_cache',{}))
                         else:
                             references[i]['verification_status']='Not checked: 25-reference metadata limit'
                 if fulltext_consent and metadata_consent:
@@ -150,11 +160,14 @@ def render_integrity_analysis():
                 analysis=compare_sources(paper,sources,citations,model)
                 analysis['consents']={'Crossref bibliography metadata':metadata_consent,
                                       'Europe PMC reference DOI lookup':fulltext_consent and metadata_consent,
-                                      'GPTZero non-bibliography body submission':detector_consent}
+                                      'GPTZero non-bibliography body submission':detector_consent and detector_backend=='GPTZero (optional external)'}
                 if semantic_note:
                     analysis['semantic_status']=semantic_note
                 status.update(label='Preparing separate AI-writing assessment')
-                ai=assess_writing(paper,consent=detector_consent,settings=settings)
+                if detector_backend=='Local CPU (free)':
+                    ai=assess_local_writing(paper,enabled=local_enabled,threshold=threshold,language=language,max_passages=int(max_passages))
+                else:
+                    ai=assess_writing(paper,consent=detector_consent,settings=settings)
                 # Use original parsed reference identity for citation mapping, resolved
                 # provider metadata only for display. Preserve raw bibliography pages.
                 state['results'][result_key]=dict(references=references,citations=citations,analysis=analysis,ai=ai)
@@ -167,12 +180,14 @@ def render_integrity_analysis():
         return
     sources_tab,similarity_tab,ai_tab=st.tabs(['Source and citation analysis','Text similarity','AI-writing assessment'])
     with sources_tab:
+        checked=sum(bool(r.get('metadata_lookup_attempted')) for r in result['references'])
+        st.caption(f"Metadata checked or cached: {checked} / {len(result['references'])} bibliography entries; limit {MAX_METADATA_REFERENCES}; unparsed entries are not submitted. Successful lookups are cached privately for this upload.")
         rows=[]
         for ref in result['references']:
-            rows.append(dict(Reference=ref['id'],Title=ref.get('title') or 'Unparsed',Authors=ref.get('authors') or 'Unparsed',Year=ref.get('year') or 'Unparsed',
+            rows.append(dict(Reference=ref['id'],Title=ref.get('title') or 'Unparsed reference',Authors=ref.get('authors') or 'Unparsed',Year=ref.get('year') or 'Unparsed',
                              DOI=ref.get('doi') or '',Link=ref.get('link') or '',
                              Source_type='Author-cited reference' if ref['cited'] else 'Ambiguous in-text citation candidate; identity not established' if ref.get('ambiguous_citation') else 'Author bibliography; no matched in-text citation',
-                             Verification=ref['verification_status'],Bibliography_pages=str(ref['pages'])))
+                             Verification=ref['verification_status'],Bibliography_pages=str(ref['pages']),Original_excerpt=ref.get('excerpt','') if ref.get('lookup_eligible') is False else ''))
         if rows:
             st.dataframe(rows,use_container_width=True,hide_index=True,column_config={'Link':st.column_config.LinkColumn('Source link')})
         else:
@@ -226,7 +241,28 @@ def render_integrity_analysis():
         ai=result['ai']
         st.markdown('#### '+ai['status'])
         st.write(ai['explanation'])
-        if ai.get('provider'):
+        if ai.get('local_detector'):
+            st.caption(f"Model: {ai['model']} · revision {ai['version']} · CPU · {ai['license']}")
+            st.write(ai['assessment'])
+            if ai.get('error'):st.warning(ai['error'])
+            coverage=ai['coverage']
+            st.write(f"Analyzed coverage: {coverage['analyzed_words']} / {coverage['total_body_words']} non-bibliography words ({coverage['percent']:.1f}%); skipped words: {coverage['skipped_words']}; pages: {coverage['pages']}.")
+            st.caption(f"Bibliography entries excluded: {coverage['bibliography_entries_excluded']} ({coverage.get('bibliography_words_excluded',0)} parsed/unparsed reference words). Bibliography section detected: {coverage['bibliography_found']}; review extraction notes.")
+            if ai.get('flagged_percentage') is not None:
+                st.metric('Analyzed text flagged as potentially AI-generated',f"{ai['flagged_percentage']:.1f}%")
+                st.caption(f"{ai['flagged_words']} unique flagged words / {ai['analyzed_words']} analyzed words. Not the actual percentage of AI used.")
+            st.caption(f"Flag threshold: score ≥ {ai['threshold']}. Application cutoff, not a calibrated authorship probability.")
+            st.write(ai['method'])
+            st.link_button('Local detector model card',ai['documentation'])
+            for passage in ai.get('sentences',[]):
+                st.caption(f"Pages {passage['pages']} · actual label-1 classifier score {passage['score']:.4f} · {'Flagged' if passage['flagged'] else 'Below threshold'}")
+                if passage['flagged']:st.markdown(highlighted_passage(passage),unsafe_allow_html=True)
+            if ai.get('skipped'):
+                with st.expander('Skipped passage coverage'):
+                    for skipped in ai['skipped']:
+                        st.caption(skipped['reason'])
+                        st.text(paper.body[skipped['start']:skipped['end']])
+        elif ai.get('provider'):
             st.caption(f"GPTZero · requested version {ai['requested_version']} · reported version {ai['reported_version']} · classification {ai['classification']} · confidence {ai['confidence_category']}")
             st.dataframe([dict(Class=key,Probability=value,Meaning='Provider classification confidence; not fraction of paper written by AI') for key,value in ai['class_probabilities'].items()],hide_index=True)
             st.link_button('Provider score interpretation',ai['documentation'])

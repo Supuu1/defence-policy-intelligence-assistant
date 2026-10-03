@@ -6,6 +6,10 @@ Provider errors are classified without logging request URLs, content or secrets.
 from datetime import datetime, timezone
 from urllib.parse import quote
 import re
+import time
+import random
+import hashlib
+from email.utils import parsedate_to_datetime
 import xml.etree.ElementTree as ET
 
 import httpx
@@ -33,7 +37,7 @@ def external_status(error):
     return 'Unavailable: malformed or unsupported external response'
 
 
-def _request(client,path,params=None):
+def _request_once(client,path,params=None):
     # Fixed provider URLs only; HTTP redirects are never followed.
     with client.stream('GET',path,params=params) as response:
         response.raise_for_status()
@@ -43,6 +47,25 @@ def _request(client,path,params=None):
             if len(data)>MAX_RESPONSE_BYTES:
                 raise ExternalSourceError('External response exceeds the 8 MB limit')
         return bytes(data)
+
+
+def _request(client,path,params=None):
+    # At most three attempts; never retry an invalid request or an excessive wait.
+    for attempt in range(3):
+        try:
+            return _request_once(client,path,params)
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code not in (429,502,503,504) or attempt==2:
+                raise
+            header=error.response.headers.get('Retry-After')
+            delay=(2**attempt)+random.uniform(0,.25)
+            if header:
+                try:delay=max(delay,float(header))
+                except ValueError:
+                    try:delay=max(delay,(parsedate_to_datetime(header)-datetime.now(timezone.utc)).total_seconds())
+                    except (ValueError,TypeError,OverflowError):raise error
+            if delay>5:raise
+            time.sleep(max(0,delay))
 
 
 def _json(client,path,params=None):
@@ -59,12 +82,17 @@ def _metadata(item):
     return dict(title=title,authors=authors,year=year,doi=doi,link=doi_link(doi))
 
 
-def resolve_reference(reference,consent=False,client=None):
+def resolve_reference(reference,consent=False,client=None,cache=None):
     if not consent:
         raise PermissionError('Explicit consent is required before sending bibliography details to Crossref.')
+    if reference.get('lookup_eligible') is False:
+        return dict(reference,verification_status='Unparsed reference — not submitted for metadata lookup')
+    cache_key=hashlib.sha256((reference.get('doi','')+'\n'+reference.get('raw','')).encode()).hexdigest()
+    if cache is not None and cache_key in cache:
+        return dict(reference,**{k:v for k,v in cache[cache_key].items() if k not in ('id','label','raw','pages','cited','ambiguous_citation','metadata_cache_hit')},metadata_cache_hit=True)
     if client is None:
         with httpx.Client(timeout=15,follow_redirects=False,headers={'User-Agent':'ResearchIntegrityAssistant/1.0'}) as owned:
-            return resolve_reference(reference,True,owned)
+            return resolve_reference(reference,True,owned,cache)
     result=dict(reference)
     result['metadata_checked_at']=datetime.now(timezone.utc).isoformat()
     try:
@@ -83,8 +111,11 @@ def resolve_reference(reference,consent=False,client=None):
             result['verification_status']='Candidate metadata only — not verified; review title/authors/year'
             if not candidates:
                 result['verification_status']='No Crossref candidate found'
+        result['metadata_lookup_attempted']=True
+        if cache is not None:cache[cache_key]=dict(result)
         return result
     except Exception as error:
+        result['metadata_lookup_attempted']=True
         result['verification_status']=external_status(error)
         return result
 

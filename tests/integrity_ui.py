@@ -28,10 +28,13 @@ class IntegrityUITests(unittest.TestCase):
         self.file_patch=patch.object(ui.st,'file_uploader',side_effect=lambda label,**kwargs:self.uploads[0] if label=='Research paper PDF' else [self.uploads[1]])
         self.settings_patch=patch.object(ui,'detector_settings',return_value={})
         self.file_patch.start();self.settings_patch.start()
+        from src.local_ai_writing import assess_local_writing
+        self.local_patch=patch.object(ui,'assess_local_writing',side_effect=lambda paper,**kwargs:assess_local_writing(paper,enabled=False))
+        self.local_patch.start()
         self.app=AppTest.from_string('from src.integrity_ui import render_integrity_analysis\nrender_integrity_analysis()',default_timeout=30)
 
     def tearDown(self):
-        self.file_patch.stop();self.settings_patch.stop()
+        self.file_patch.stop();self.settings_patch.stop();self.local_patch.stop()
 
     def run_button(self):
         return next(b for b in self.app.button if b.label=='Run Research Paper Integrity Analysis')
@@ -48,7 +51,7 @@ class IntegrityUITests(unittest.TestCase):
             result=next(iter(self.app.session_state['integrity_private']['results'].values()))
             self.assertTrue(result['analysis']['matches'][0]['cited'])
             self.assertTrue(result['analysis']['matches'][0]['quoted'])
-            self.assertEqual(result['ai']['status'],'AI authorship assessment unavailable')
+            self.assertEqual(result['ai']['status'],'Experimental local AI-writing assessment')
             self.assertTrue(self.app.get('download_button'))
             self.app.run()
             self.assertFalse(self.app.exception)
@@ -86,6 +89,7 @@ class IntegrityUITests(unittest.TestCase):
                         documentation='https://support.gptzero.me/',characters_sent=len(paper.body))
         with patch.object(ui,'detector_settings',return_value=settings),patch.object(ui,'assess_writing',side_effect=assessment) as assess:
             self.app.run()
+            next(s for s in self.app.selectbox if s.label=='AI-writing assessment method').set_value('GPTZero (optional external)').run()
             self.run_button().click().run()
             self.assertFalse(assess.call_args.kwargs['consent'])
             detector=next(c for c in self.app.checkbox if 'GPTZero' in c.label)
@@ -110,6 +114,7 @@ class IntegrityUITests(unittest.TestCase):
             return assess_writing(paper,consent,settings,client)
         with patch.object(ui,'detector_settings',return_value=settings),patch.object(ui,'assess_writing',side_effect=assessment):
             self.app.run()
+            next(s for s in self.app.selectbox if s.label=='AI-writing assessment method').set_value('GPTZero (optional external)').run()
             next(c for c in self.app.checkbox if 'GPTZero' in c.label).check().run()
             client.post.assert_not_called()
             self.run_button().click().run()
@@ -123,6 +128,28 @@ class IntegrityUITests(unittest.TestCase):
             self.app.run()
             client.post.assert_called_once()
             self.assertFalse(self.app.exception)
+
+    def test_free_local_detector_does_not_require_keys_or_send_paper(self):
+        from src.local_ai_writing import assess_local_writing
+        from unittest.mock import Mock
+        import re
+        class Tokenizer:
+            def num_special_tokens_to_add(self,pair=False):return 2
+            def __call__(self,text,add_special_tokens=True,**kwargs):
+                spans=[m.span() for m in re.finditer(r'\w+|[^\w\s]',text)]
+                return dict(input_ids=[1]*(len(spans)+(2 if add_special_tokens else 0)),offset_mapping=spans)
+        def assess(paper,**kwargs):return assess_local_writing(paper,resource=(Tokenizer(),None,None),**kwargs)
+        with patch.object(ui,'assess_local_writing',side_effect=assess) as local,patch('src.local_ai_writing.score_passage',return_value=.9),patch.object(ui,'assess_writing') as external:
+            self.app.run()
+            self.run_button().click().run()
+            self.assertFalse(self.app.exception)
+            external.assert_not_called();local.assert_called_once()
+            metrics={m.label:m.value for m in self.app.metric}
+            self.assertEqual(metrics['Analyzed text flagged as potentially AI-generated'],'100.0%')
+            self.assertNotIn('AI-generation probability',metrics)
+            self.assertTrue(any('<mark>' in m.value for m in self.app.markdown))
+            self.app.run();local.assert_called_once()
+            self.assertTrue(self.app.get('download_button'))
 
     def test_new_upload_requires_new_consent_and_clear_removes_state(self):
         self.app.run()
