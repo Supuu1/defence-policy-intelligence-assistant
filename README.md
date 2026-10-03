@@ -407,3 +407,178 @@ Additional offline checks:
 python tests/verify_gemini.py
 python tests/summary_reliability.py
 ```
+
+## Research Paper Integrity Analysis
+
+The **Research Paper Integrity** tab is independent of the existing corpus and
+Gemini features. Upload the submitted PDF and optional reference PDFs in this
+tab. Extraction, citation parsing and passage comparison run locally on the
+Streamlit server. Papers, extracted text, embeddings and results are not placed
+in the shared document disk cache or sent to Gemini. Each session owns its
+uploads/results. **Clear private integrity uploads and results** removes the
+workflow state and resets its upload widgets. Hosting administrators still
+control the server; this is not end-to-end encrypted storage.
+
+The interface separates three analyses and downloads a Markdown report with
+actual matching passages, document/page references, source URLs, coverage,
+methodology, consent settings and limitations. Evidence is paginated in the UI;
+the report and percentages use all detected matches. Downloading or ordinary Streamlit
+reruns do not issue new external requests. Changing uploads resets consent;
+changing consent/settings hides results belonging to the previous configuration.
+
+### Citations and source identity
+
+- Extracted pages retain PDF page numbers. Sparse pages use local Tesseract OCR;
+  unreadable pages and OCR use are reported. Integrity uploads are limited to
+  25 MB and 300 pages per PDF.
+- Supported bibliography headings include References, References and Notes,
+  Bibliography, Works Cited, Literature Cited and Reference List. Reference
+  parsing supports numbered entries and common surname/initial author-year
+  entries. In-text parsing supports numeric brackets/lists/ranges, common
+  parenthetical/narrative author-year forms and DOI identifiers. Missing and
+  ambiguous bibliography mappings are different statuses. Superscripts,
+  unusual layouts, non-Latin citation styles and complex line wrapping may need
+  manual review. No detected heading means bibliography exclusion may be
+  incomplete; the app and report state this explicitly.
+- An exact Crossref DOI record verifies the record's existence. It does not
+  establish that the bibliography title/authors/year are correct or that the
+  paper used the source. Bibliographic search results without an exact DOI are
+  shown as **unverified candidates**, never automatically adopted as references.
+- For an uploaded comparison paper, explicitly select its bibliography entry
+  if it is the same source. The association is recorded as user-confirmed, not
+  scholarly verification. Without that association, a text match remains a
+  discovered/checked source; topic or semantic similarity never establishes use.
+  Europe PMC full text is associated only through an exact verified DOI.
+
+### Text similarity methodology and coverage
+
+The displayed label is **similarity within checked sources**, not a plagiarism
+score. A zero result does not imply originality. Common methods language,
+boilerplate, quotations, properly cited material and coincidental overlap may
+be benign. Neither similarity nor an AI-writing detector establishes misconduct.
+
+Word tokens use Unicode NFKC normalization and case folding. Whitespace,
+punctuation and case changes are ignored. Exact runs require at least eight
+matching tokens. Near-exact candidate pairs use non-overlapping 60-word windows,
+a token sequence ratio of at least 0.88, and at least eight identical tokens.
+Only actually matching token positions contribute to overlap; substitutions in
+a near-exact passage do not count. The denominator is the number of examined
+non-bibliography submitted-body tokens, including quotations and citation marker
+tokens. The numerator is the union of matched submitted positions across all
+exact and near-exact matches. Duplicated/overlapping matches cannot inflate it.
+The app reports unique matched tokens and the denominator so the calculation
+can be reproduced.
+
+Quotation boundaries and nearby mapped citations are shown separately.
+A quotation without an established source-citation association still requires
+review and enters potentially unattributed overlap. Any observed mapped source
+citation at the same matched positions removes those positions from that subset;
+quotation/citation parsing is heuristic, not proof of correct attribution.
+Quoted-and-source-cited overlap is a separate subset of total overlap.
+Bibliography sections are excluded from both submitted and uploaded source text
+when detected; Europe PMC comparison uses article body XML, excluding the back
+bibliography.
+
+Comparison limits are explicit: first 20,000 submitted-body tokens, first 50,000
+source-body tokens, ten source attempts, first 1,000 60-word windows, ten lexical
+candidates/window and twenty source positions per exact seed. These bounds can
+miss alignments, short reuse and paraphrases. Coverage lists checked, unreadable,
+duplicate, unconsented, unavailable and limited sources, source links, token
+counts, retrieval timestamps/licenses where returned, semantic status, and how
+much extracted submitted text was examined. The search is not an internet-wide,
+publisher-database or paywall search.
+
+Optional semantic comparison uses local
+`sentence-transformers/all-MiniLM-L6-v2` cosine similarity (threshold 0.82).
+It returns actual submitted/source windows and the cosine value separately;
+semantic matches contribute **zero** tokens to the overlap percentage. It is an
+exploratory English-oriented model, not a paraphrase/plagiarism verdict.
+The integrity workflow loads this model with `local_files_only=True`; it never
+downloads it. Pre-cache the model in the deployment environment if this option
+is needed. If unavailable or encoding fails, lexical analysis is retained and
+the semantic coverage/status is reported. No paper text is sent to an embedding
+service.
+
+### Optional external services and consent
+
+No external service is contacted for this workflow until the user enables the
+specific consent checkbox and presses **Run Research Paper Integrity Analysis**.
+Metadata, open-access lookup and detector consent are independent and scoped to
+the current uploaded content. Merely enabling a checkbox sends nothing.
+
+| Service | What is sent with consent | Requirement | Scope |
+| --- | --- | --- | --- |
+| Crossref | Reference DOIs, or up to 1,000 characters of each bibliography entry | No API key | First 25 bibliography entries; exact DOI retrieval or unverified bibliographic candidates |
+| Europe PMC | Verified bibliography DOI identifiers | No API key; also requires Crossref consent | Up to five open-access sources, within the ten-source comparison limit |
+| GPTZero | Submitted non-bibliography body text; configured model/version | `GPTZERO_API_KEY` and `GPTZERO_MODEL_VERSION` | Optional paid/external detector; no automatic retry or provider substitution |
+
+The adapters were checked against the official
+[Crossref REST API documentation](https://github.com/CrossRef/rest-api-doc),
+[Crossref access documentation](https://www.crossref.org/documentation/retrieve-metadata/rest-api/access-and-authentication/),
+[Europe PMC REST service documentation](https://europepmc.org/RestfulWebService),
+and [Europe PMC open-access subset](https://europepmc.org/downloads/openaccess).
+Only Europe PMC records marked open access with an exact matching DOI and a
+PMCID are fetched through its `fullTextXML` endpoint. There is no arbitrary-URL
+fetching, publisher scraping or paywall bypass. Full-text XML has no PDF page
+numbers, so page references are reported as unavailable. HTTP timeouts, rate
+limits, inaccessible records, oversized responses, malformed XML/JSON and
+unsupported entities become coverage statuses; no source or passage is inferred.
+
+For optional GPTZero, put these **top-level** settings in Streamlit Secrets or
+local environment variables (environment values take precedence):
+
+```toml
+GPTZERO_API_KEY = "YOUR_GPTZERO_API_KEY"
+GPTZERO_MODEL_VERSION = "YOUR_ACCOUNT_SUPPORTED_MODEL_VERSION"
+```
+
+Choose an explicit version supported by your account using the provider's
+[current API documentation](https://gptzero.me/developers). No default detector
+version is invented. The adapter uses `POST /v2/predict/text`, `x-api-key`,
+`document` and `version`. It accepts documented `document_classification` and
+`class_probabilities` responses. These class probabilities express confidence
+in the HUMAN_ONLY/MIXED/AI_ONLY classification for similar documents, **not the
+percentage of the paper written by AI**. Requested and provider-reported versions
+are displayed separately; absence of a reported version is disclosed. Provider
+sentence results are displayed only when the sentence occurs in submitted text;
+numeric sentence fields are preserved as uninterpreted provider fields, never
+converted into paper-level AI percentages. See the provider's
+[official score interpretation](https://support.gptzero.me/articles/8947054519-how-do-i-use-and-interpret-the-results-from-your-api).
+
+Missing configuration, absent consent, invalid/malformed responses, service
+failures or bodies above the local 100,000-character detector limit result in
+**AI authorship assessment unavailable** with an explanation. Input is never
+silently truncated. Any attempted failed external submission is recorded in the
+report because contents might already have reached the provider. Otherwise local
+sentence-length/repetition observations are offered solely as writing
+observations, not an authorship classifier. No Gemini prompt asks for an AI
+percentage. Detector errors/false positives, language, genre, translation,
+editing and distribution shift limit all provider inferences.
+
+### Verification for this feature
+
+Offline focused checks:
+
+```bash
+python tests/research_integrity.py
+python tests/integrity_ui.py
+```
+
+Locally verified on 2026-10-03: 23 service tests and four Streamlit workflow tests
+cover citation mapping, missing/ambiguous references, bibliography exclusion,
+quoted overlap, duplicate/overlapping positions, percentage denominator,
+cross-page attribution, inaccessible sources, semantic-score separation,
+malformed detector scores, consent gates, rerun duplication, new-upload consent
+reset, report creation, and clearing private state. Full-app startup/rerun and
+existing Gemini summary/client/parsing/token-budget regression checks passed.
+The cached MiniLM model loaded and produced 384-dimensional embeddings without
+network access.
+
+Live verified: Crossref resolved the public fixture DOI
+`10.1371/journal.pone.0000308`, and Europe PMC returned readable open-access
+article body XML for that same DOI. Only this public identifier was sent; no
+uploaded paper or private bibliography was used in live validation. GPTZero was
+verified against its official documentation and mocked responses, **not live
+credentials**. Its account/version compatibility still requires a configured key,
+explicit user consent and deployment validation. No deployed app was modified.
+The existing Gemini model settings and summary code remain unchanged.

@@ -58,6 +58,7 @@ from src.semantic_retrieval import (
     semantic_search,
 )
 from src.report_service import build_markdown_report
+from src.integrity_ui import render_integrity_analysis
 from src.source_navigation import chunks_for_page, resolve_source_view
 from src.timeline_service import extract_timeline_events
 
@@ -1375,6 +1376,7 @@ with right_col:
         entities_tab,
         dashboard_tab,
         overview_tab,
+        integrity_tab,
     ) = st.tabs(
         [
             "Executive Summary",
@@ -1384,6 +1386,7 @@ with right_col:
             "Entities & Facts",
             "Intelligence Dashboard",
             "Corpus Overview",
+            "Research Paper Integrity",
         ]
     )
     st.session_state.setdefault("executive_summary_cache", {})
@@ -2303,3 +2306,7 @@ with right_col:
                         f"{source_view.page_number}"
                     ),
                 )
+
+
+with integrity_tab:
+    render_integrity_analysis()

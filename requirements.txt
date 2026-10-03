@@ -9,3 +9,4 @@ pillow>=10,<13
 google-genai>=1.75,<2
 python-dotenv>=1,<2
 pydantic>=2,<3
+httpx>=0.28,<1
