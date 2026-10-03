@@ -450,6 +450,15 @@ def integrity_report(paper,citations,analysis,ai):
                       'Class probabilities (not percentage of text written by AI):',literal(json.dumps(ai['class_probabilities'])),
                       'Passage-level provider results:',literal(json.dumps(ai.get('sentences',[]),ensure_ascii=False)),
                       f"Provider documentation: {ai['documentation']}",f"Detector text characters sent: {ai['characters_sent']}"])
+        lines.extend([f"Detector verdict: {ai.get('verdict',ai['classification'])}; provider confidence category: {ai.get('confidence_category','Not returned')}",
+                      f"AI-generation probability (AI_ONLY confidence, not fraction written by AI): {ai.get('ai_generation_probability','Not returned')}",
+                      'Analysis coverage (bibliography excluded):',literal(json.dumps(ai.get('coverage',{}))),
+                      f"Percentage of analyzed text flagged as potentially AI-generated: {str(ai['flagged_percentage'])+'%' if ai.get('flagged_percentage') is not None else 'Unavailable'}",
+                      f"Flagged words: {ai.get('flagged_words','Unavailable')}; analyzed words: {ai.get('analyzed_words','Unavailable')}",
+                      ai.get('threshold','No supported sentence flags'),ai.get('percentage_method',''),ai.get('passage_note',''),
+                      f"Sentence-flag coverage: {ai.get('passage_covered_words','Unavailable')} words; unaligned passages: {ai.get('unaligned_passages','Unavailable')}",
+                      'For partial coverage, the verdict and probabilities apply only to the submitted excerpt. Remaining text was not assessed.'])
+
     else:
         lines.append(literal(ai.get('observations',{})))
     if analysis.get('consents'):

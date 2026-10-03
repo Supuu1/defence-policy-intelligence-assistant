@@ -510,7 +510,7 @@ the current uploaded content. Merely enabling a checkbox sends nothing.
 | --- | --- | --- | --- |
 | Crossref | Reference DOIs, or up to 1,000 characters of each bibliography entry | No API key | First 25 bibliography entries; exact DOI retrieval or unverified bibliographic candidates |
 | Europe PMC | Verified bibliography DOI identifiers | No API key; also requires Crossref consent | Up to five open-access sources, within the ten-source comparison limit |
-| GPTZero | Submitted non-bibliography body text; configured model/version | `GPTZERO_API_KEY` and `GPTZERO_MODEL_VERSION` | Optional paid/external detector; no automatic retry or provider substitution |
+| GPTZero | Submitted non-bibliography body text; configured model/version | `GPTZERO_API_KEY`, `GPTZERO_MODEL_VERSION`, `GPTZERO_MAX_CHARACTERS` | Optional paid/external detector; no automatic retry or provider substitution |
 
 The adapters were checked against the official
 [Crossref REST API documentation](https://github.com/CrossRef/rest-api-doc),
@@ -530,6 +530,7 @@ local environment variables (environment values take precedence):
 ```toml
 GPTZERO_API_KEY = "YOUR_GPTZERO_API_KEY"
 GPTZERO_MODEL_VERSION = "YOUR_ACCOUNT_SUPPORTED_MODEL_VERSION"
+GPTZERO_MAX_CHARACTERS = "YOUR_ACCOUNT_CONFIRMED_PER_REQUEST_CHARACTER_LIMIT"
 ```
 
 Choose an explicit version supported by your account using the provider's
@@ -540,31 +541,69 @@ version is invented. The adapter uses `POST /v2/predict/text`, `x-api-key`,
 in the HUMAN_ONLY/MIXED/AI_ONLY classification for similar documents, **not the
 percentage of the paper written by AI**. Requested and provider-reported versions
 are displayed separately; absence of a reported version is disclosed. Provider
-sentence results are displayed only when the sentence occurs in submitted text;
-numeric sentence fields are preserved as uninterpreted provider fields, never
-converted into paper-level AI percentages. See the provider's
-[official score interpretation](https://support.gptzero.me/articles/8947054519-how-do-i-use-and-interpret-the-results-from-your-api).
+sentence flags use the documented boolean `highlight_sentence_for_ai`. The application
+adds no probability threshold. Only exact, uniquely aligned provider passages are
+highlighted, with original page references. Ambiguous repeated passages are omitted
+and disclosed. Numeric sentence fields remain uninterpreted provider evidence.
 
-Missing configuration, absent consent, invalid/malformed responses, service
-failures or bodies above the local 100,000-character detector limit result in
-**AI authorship assessment unavailable** with an explanation. Input is never
-silently truncated. Any attempted failed external submission is recorded in the
-report because contents might already have reached the provider. Otherwise local
-sentence-length/repetition observations are offered solely as writing
-observations, not an authorship classifier. No Gemini prompt asks for an AI
-percentage. Detector errors/false positives, language, genre, translation,
-editing and distribution shift limit all provider inferences.
+**AI-generation probability** is `class_probabilities.ai` (confidence in AI_ONLY),
+not the proportion of AI-written text. Mixed-class confidence remains separate.
+**Percentage of analyzed text flagged as potentially AI-generated** is the union
+of flagged analyzed word-token positions divided by all analyzed non-bibliography
+word-token positions × 100. Overlapping/duplicate flags count once. Word tokens
+use Unicode NFKC/case-fold normalization and the existing word tokenizer. The
+percentage is available only when validated boolean sentence flags cover every
+submitted word. Incomplete/absent/ambiguous passage results produce no percentage;
+valid highlights still appear. This percentage is not the actual amount of AI used.
+Bibliography exclusion is heading based; review extraction notes for unsupported layouts.
+
+Set the positive `GPTZERO_MAX_CHARACTERS` using the per-request limit confirmed
+in your GPTZero API account; the local implementation ceiling is 1,000,000.
+The publicly readable docs did not establish a universally applicable API limit
+or a current account-supported model version, so neither is guessed. Long papers
+send only an opening excerpt within that configured limit, trimming at a word
+boundary. The consent UI announces this behavior. Coverage lists analyzed/total
+body words, characters and pages; verdicts and probabilities apply to that excerpt
+only. One request is used; chunk probabilities are never averaged. No API call
+occurs on ordinary Streamlit reruns or downloads; private results remain scoped
+to the session, document and detector settings. Clearing uploads removes results.
+
+Missing settings, absent consent, unreadable text, invalid responses, credentials,
+quota/rate limits, unsupported configuration, timeouts and server failures have
+actionable explanations, with no inferred scores and no automatic paid retries.
+Logs contain exception class and HTTP status only, never payloads or keys. Failed
+submission attempts are recorded because text may already have reached GPTZero.
+Local observations are separate and are not detector evidence. False positives,
+language, genre, editing and distribution shift limit all assessments.
+
+### GPTZero account and deployment
+
+The [official setup guide](https://support.gptzero.me/articles/5840144813-how-can-i-get-the-api-and-request-code-samples)
+requires an account, an API subscription and an API key from the API dashboard.
+Confirm current pricing, quota, supported version and input allowance in that
+account; no price or dashboard-subscription entitlement is assumed. The provider
+also offers [limited free trials in its API docs](https://support.gptzero.me/articles/7472477101-can-i-try-the-api-for-free),
+which do not replace this app's authenticated integration.
+
+On Streamlit Cloud: deploy these changes on the configured main branch, add the
+three top-level settings above under **App settings → Secrets**, then reboot the
+app. Locally use the same names in `.env` and run `streamlit run app.py`. Environment
+values take precedence. No new dependency or Gemini setting is required. Upload
+a permissioned paper, explicitly select detector consent, and run the analysis.
+Inspect coverage before interpreting either metric. The downloaded Markdown report
+contains verdicts, provider/version, genuine passages, coverage and methodology.
 
 ### Verification for this feature
 
 Offline focused checks:
 
 ```bash
+python tests/ai_writing.py
 python tests/research_integrity.py
 python tests/integrity_ui.py
 ```
 
-Locally verified on 2026-10-03: 23 service tests and four Streamlit workflow tests
+Locally verified on 2026-10-03: 11 detector tests, 23 integrity service tests and five Streamlit workflow tests
 cover citation mapping, missing/ambiguous references, bibliography exclusion,
 quoted overlap, duplicate/overlapping positions, percentage denominator,
 cross-page attribution, inaccessible sources, semantic-score separation,
@@ -580,5 +619,8 @@ article body XML for that same DOI. Only this public identifier was sent; no
 uploaded paper or private bibliography was used in live validation. GPTZero was
 verified against its official documentation and mocked responses, **not live
 credentials**. Its account/version compatibility still requires a configured key,
-explicit user consent and deployment validation. No deployed app was modified.
+account-confirmed per-request limit, explicit user consent and deployment validation.
+No GPTZERO_API_KEY, GPTZERO_MODEL_VERSION or GPTZERO_MAX_CHARACTERS was available
+in the local settings during this update; no authenticated GPTZero call was made.
+No deployed app was modified.
 The existing Gemini model settings and summary code remain unchanged.

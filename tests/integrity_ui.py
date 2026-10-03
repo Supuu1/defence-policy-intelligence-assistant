@@ -99,6 +99,31 @@ class IntegrityUITests(unittest.TestCase):
             self.assertNotIn('ai_percentage',result['ai'])
             self.assertNotIn('private-test-placeholder',str(result))
 
+    def test_detector_highlights_metrics_report_and_rerun(self):
+        from src.ai_writing import assess_writing
+        settings={'GPTZERO_API_KEY':'private-test-key','GPTZERO_MODEL_VERSION':'account-version','GPTZERO_MAX_CHARACTERS':'5000'}
+        client=Mock()
+        def assessment(paper,consent,settings):
+            client.post.return_value.json.return_value={'version':'reported-version','documents':[dict(
+                document_classification='AI_ONLY',class_probabilities={'human':.1,'mixed':.2,'ai':.7},
+                sentences=[{'sentence':paper.body.strip(),'highlight_sentence_for_ai':True}])]}
+            return assess_writing(paper,consent,settings,client)
+        with patch.object(ui,'detector_settings',return_value=settings),patch.object(ui,'assess_writing',side_effect=assessment):
+            self.app.run()
+            next(c for c in self.app.checkbox if 'GPTZero' in c.label).check().run()
+            client.post.assert_not_called()
+            self.run_button().click().run()
+            self.assertFalse(self.app.exception)
+            client.post.assert_called_once()
+            metrics={m.label:m.value for m in self.app.metric}
+            self.assertEqual(metrics['AI-generation probability'],'70.0%')
+            self.assertEqual(metrics['Percentage of analyzed text flagged as potentially AI-generated'],'100.0%')
+            self.assertTrue(any('<mark>' in m.value for m in self.app.markdown))
+            self.assertTrue(self.app.get('download_button'))
+            self.app.run()
+            client.post.assert_called_once()
+            self.assertFalse(self.app.exception)
+
     def test_new_upload_requires_new_consent_and_clear_removes_state(self):
         self.app.run()
         self.consent().check().run()

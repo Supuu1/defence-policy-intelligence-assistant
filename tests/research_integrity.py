@@ -220,7 +220,7 @@ class IntegrityTests(unittest.TestCase):
         p=paper('Actual paper sentence with sufficiently readable text.')
         client=Mock()
         client.post.return_value.json.return_value={'version':'reported-model','documents':[dict(document_classification='MIXED',class_probabilities={'human':.2,'mixed':.7,'ai':.1},sentences=[{'sentence':p.body.strip(),'generated_prob':.4}])]}
-        result=assess_writing(p,True,{'GPTZERO_API_KEY':'private-placeholder','GPTZERO_MODEL_VERSION':'requested-model'},client)
+        result=assess_writing(p,True,{'GPTZERO_API_KEY':'private-placeholder','GPTZERO_MODEL_VERSION':'requested-model','GPTZERO_MAX_CHARACTERS':'5000'},client)
         self.assertEqual(result['class_probabilities']['mixed'],.7)
         self.assertEqual(result['reported_version'],'reported-model')
         self.assertNotIn('ai_percentage',result)
@@ -229,7 +229,7 @@ class IntegrityTests(unittest.TestCase):
 
     def test_detector_malformed_response_does_not_infer_score(self):
         client=Mock();client.post.return_value.json.return_value={'documents':[{'document_classification':'MIXED','class_probabilities':{'ai':120}}]}
-        result=assess_writing(paper('Actual text.'),True,{'GPTZERO_API_KEY':'placeholder','GPTZERO_MODEL_VERSION':'test'},client)
+        result=assess_writing(paper('Actual text.'),True,{'GPTZERO_API_KEY':'placeholder','GPTZERO_MODEL_VERSION':'test','GPTZERO_MAX_CHARACTERS':'5000'},client)
         self.assertEqual(result['status'],'AI authorship assessment unavailable')
         self.assertNotIn('class_probabilities',result)
 

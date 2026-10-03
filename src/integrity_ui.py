@@ -7,7 +7,7 @@ from src.research_integrity import (
     LIMITATIONS, METHOD, MAX_SOURCES,
 )
 from src.scholarly_sources import resolve_reference, retrieve_open_access, MAX_METADATA_REFERENCES
-from src.ai_writing import assess_writing, detector_settings
+from src.ai_writing import assess_writing, detector_settings, input_limit, highlighted_passage
 
 
 @st.cache_resource(show_spinner=False)
@@ -77,10 +77,17 @@ def render_integrity_analysis():
         st.caption('AI authorship assessment unavailable: no supported detector key and explicit model/version configured. Local writing observations remain available.')
     else:
         st.caption(f"Configured detector: GPTZero · requested model/version: {settings['GPTZERO_MODEL_VERSION']}. This may consume your provider quota; probability is not a percentage written by AI.")
+    limit=input_limit(settings)
+    if configured and limit:
+        st.caption(f'Detector will receive at most the first {limit:,} non-bibliography characters in one request. Longer papers receive a partial assessment; scores are never averaged across chunks.')
+    elif configured:
+        st.warning('Set GPTZERO_MAX_CHARACTERS to your account-confirmed API request limit before detection can run.')
     if fulltext_consent and not metadata_consent:
         st.info('Europe PMC comparison also requires Crossref metadata consent so exact reference DOIs can be verified first.')
     options=dict(associations=associations,semantic=semantic,metadata=metadata_consent,
-                 fulltext=fulltext_consent,detector=detector_consent,detector_version=settings.get('GPTZERO_MODEL_VERSION',''))
+                 fulltext=fulltext_consent,detector=detector_consent,detector_version=settings.get('GPTZERO_MODEL_VERSION',''),
+                 detector_limit=settings.get('GPTZERO_MAX_CHARACTERS',''),
+                 detector_credentials=hashlib.sha256(settings.get('GPTZERO_API_KEY','').encode()).hexdigest())
     result_key=hashlib.sha256(json.dumps(options,sort_keys=True).encode()).hexdigest()
     if st.button('Run Research Paper Integrity Analysis',key='integrity-run',type='primary',disabled=not paper.body.strip()):
         try:
@@ -223,11 +230,30 @@ def render_integrity_analysis():
             st.caption(f"GPTZero · requested version {ai['requested_version']} · reported version {ai['reported_version']} · classification {ai['classification']} · confidence {ai['confidence_category']}")
             st.dataframe([dict(Class=key,Probability=value,Meaning='Provider classification confidence; not fraction of paper written by AI') for key,value in ai['class_probabilities'].items()],hide_index=True)
             st.link_button('Provider score interpretation',ai['documentation'])
-            if ai['sentences']:
-                st.caption('Passage-level fields returned by the provider; raw values, not AI-written text percentages.')
-                st.dataframe(ai['sentences'],hide_index=True,use_container_width=True)
-            else:
-                st.caption('Passage-level results were not available in the validated provider response.')
+            st.write('Detector assessment: '+ai.get('verdict',ai['classification']))
+            if ai.get('ai_generation_probability') is not None:
+                st.metric('AI-generation probability',f"{100*ai['ai_generation_probability']:.1f}%")
+                st.caption('Probability of the AI_ONLY class for the analyzed input. This is confidence about authorship, not the percentage of the paper written by AI; mixed-class probability is displayed separately.')
+            coverage=ai.get('coverage')
+            if coverage:
+                st.write(f"Analysis coverage: {coverage['analyzed_words']:,} / {coverage['total_body_words']:,} non-bibliography words ({coverage['percent']:.1f}%); pages {coverage['pages']}.")
+                if coverage['partial']:
+                    st.warning('Partial assessment: verdict and probabilities apply only to the submitted opening excerpt, not the entire paper. Remaining text was not sent or assessed.')
+            if ai.get('flagged_percentage') is not None:
+                st.metric('Percentage of analyzed text flagged as potentially AI-generated',f"{ai['flagged_percentage']:.1f}%")
+                st.caption(f"{ai['flagged_words']} flagged words / {ai['analyzed_words']} analyzed words. This is not the actual amount of AI used.")
+            st.caption(ai.get('passage_note','Passage flags were not provided; no highlights or text percentage are inferred.'))
+            if ai.get('threshold'):
+                st.caption(f"Sentence-flag coverage: {ai.get('passage_covered_words',0)} / {ai.get('analyzed_words',0)} analyzed words; {ai.get('unaligned_passages',0)} unaligned provider passages.")
+                st.caption(ai['threshold'])
+                st.caption(ai['percentage_method'])
+            for sentence in ai.get('sentences',[]):
+                if sentence.get('flagged') is True:
+                    st.caption(f"Provider-flagged passage · pages {sentence['pages']}")
+                    st.markdown(highlighted_passage(sentence),unsafe_allow_html=True)
+            if ai.get('sentences'):
+                with st.expander('Validated passage-level detector evidence'):
+                    st.dataframe(ai['sentences'],hide_index=True,use_container_width=True)
         else:
             st.markdown('##### Local writing observations — not authorship evidence')
             st.json(ai['observations'])
