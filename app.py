@@ -26,7 +26,9 @@ from src.conflict_service import generate_conflict_analysis
 from src.corpus_service import deduplicate_documents_by_content
 from src.intelligence_service import (
     NoSummarizableContentError,
-    generate_executive_summary_from_chunks,
+    summary_cache_key,
+    cached_executive_summary,
+    local_extractive_summary,
     generate_policy_comparison,
     prepare_evidence,
 )
@@ -432,6 +434,8 @@ with left_col:
                     "corpus_index_state",
                     "last_rag_result",
                     "executive_summary_cache",
+                    "executive_summary_results",
+                    "executive_summary_local",
                     "policy_comparison_cache",
                     "conflict_analysis_cache",
                     "timeline_analysis_cache",
@@ -1403,13 +1407,17 @@ with right_col:
             key="summary_scope",
         )
         summary_document_id = summary_labels[summary_scope]
-        summary_key = f"summary-v1:{corpus_key}:{summary_document_id or 'all'}"
+        scoped_chunks = [chunk for chunk in text_chunks
+                         if summary_document_id is None or chunk.get("document_id") == summary_document_id]
+        try:
+            summary_key = summary_cache_key(scoped_chunks)
+        except RAGServiceError:
+            summary_key = f"local-summary:{corpus_key}:{summary_document_id or 'all'}"
         cached_summary = st.session_state.executive_summary_cache.get(summary_key)
         summary_ready = bool(
             vector_index is not None
             and searchable_documents
             and text_chunks
-            and gemini_available
         )
         if not gemini_available:
             st.warning(f"Gemini unavailable: {gemini_diagnostic}")
@@ -1418,8 +1426,12 @@ with right_col:
             disabled=not summary_ready,
             use_container_width=True,
         )
+        st.session_state.setdefault("executive_summary_results", {})
+        st.session_state.setdefault("executive_summary_local", {})
         if summary_action:
             st.session_state.executive_summary_cache.pop(summary_key, None)
+            st.session_state.executive_summary_results.pop(summary_key, None)
+            st.session_state.executive_summary_local.pop(summary_key, None)
             with st.status("Preparing grounded summary evidence...", expanded=True) as status:
                 try:
                     scoped_chunks = [
@@ -1434,8 +1446,8 @@ with right_col:
                             label=f"{stage}: {group_number} / {total_groups}"
                         )
 
-                    generated = generate_executive_summary_from_chunks(
-                        scoped_chunks,
+                    generated = cached_executive_summary(
+                        scoped_chunks, st.session_state.executive_summary_results,
                         progress_callback=update_summary_progress,
                     )
                     cached_summary = {
@@ -1456,13 +1468,27 @@ with right_col:
                 except RAGServiceError as error:
                     status.update(label="Summary generation failed.", state="error")
                     st.warning(f"Summary generation failed: {error}")
-                except Exception:
-                    logger.exception("Executive summary generation failed")
+                    try:
+                        local = local_extractive_summary(scoped_chunks)
+                        st.session_state.executive_summary_local[summary_key] = {
+                            "sections": local.sections, "evidence": local.cited_evidence,
+                            "cited_evidence": local.cited_evidence,
+                            "evidence_strength": local.evidence_strength, "scope": summary_scope,
+                            "local_error": str(error),
+                        }
+                    except NoSummarizableContentError as local_error:
+                        st.warning(str(local_error))
+                except Exception as error:
+                    logger.error("Executive summary failed: exception_type=%s", type(error).__name__)
                     status.update(label="Summary generation failed.", state="error")
                     st.error("The executive summary could not be generated.")
 
-        cached_summary = st.session_state.executive_summary_cache.get(summary_key)
+        cached_summary = (st.session_state.executive_summary_cache.get(summary_key)
+                          or st.session_state.executive_summary_local.get(summary_key))
         if cached_summary:
+            if cached_summary.get("local_error"):
+                st.info("Local extractive summary — actual source excerpts, not an AI-generated executive summary.")
+                st.caption(cached_summary["local_error"])
             summary_markdown = intelligence_markdown(
                 cached_summary["sections"], cached_summary["cited_evidence"]
             )

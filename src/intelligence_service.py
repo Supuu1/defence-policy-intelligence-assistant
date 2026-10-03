@@ -1,12 +1,16 @@
 """Grounded executive-summary and policy-comparison generation."""
 
 from dataclasses import dataclass
+import hashlib
+import json
+import re
+from collections import Counter
 
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from src.rag_service import RAGServiceError, generate_structured_response
+from src.rag_service import RAGServiceError, MalformedStructuredResponseError, generate_structured_response, get_gemini_model
 
 
 SUMMARY_OUTPUT_TOKENS = 2400
@@ -103,10 +107,7 @@ class NoSummarizableContentError(RAGServiceError):
 
 
 SMALL_SUMMARY_MAX_CHUNKS = 30
-SMALL_SUMMARY_MAX_CHARACTERS = 30_000
 SUMMARY_GROUP_MAX_CHUNKS = 20
-SUMMARY_GROUP_MAX_CHARACTERS = 20_000
-FINAL_SUMMARY_MAX_EVIDENCE = 32
 
 
 def prepare_evidence(chunks: list[dict], prefix: str = "S") -> list[dict]:
@@ -272,52 +273,60 @@ def generate_executive_summary(evidence: list[dict]) -> IntelligenceResult:
         SUMMARY_OUTPUT_TOKENS,
         SUMMARY_RETRY_OUTPUT_TOKENS,
     )
-    return _validated_result(parsed, evidence, SUMMARY_SECTIONS)
+    result = _validated_result(parsed, evidence, SUMMARY_SECTIONS)
+    if not result.sections:
+        raise MalformedStructuredResponseError("Gemini returned no summary points with valid source references. Use the local extractive summary.")
+    return result
+
+
+# UTF-8 byte count is a conservative token upper bound for text (including
+# non-English PDFs). Reserve space for schema, instructions, and evidence wrappers.
+SUMMARY_INPUT_TOKEN_BUDGET = 12_000
+SUMMARY_PROMPT_RESERVE = 2_000
+SUMMARY_TEXT_TOKEN_BUDGET = SUMMARY_INPUT_TOKEN_BUDGET - SUMMARY_PROMPT_RESERVE
+
+
+def estimate_text_tokens(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _bounded_chunks(chunks):
+    """Split even a single huge extraction, retaining its exact page metadata."""
+    result = []
+    for chunk in chunks:
+        text = chunk.get("text")
+        if not isinstance(text, str) or not text.strip() or not any(c.isalnum() for c in text):
+            continue
+        text = text.strip()
+        # Each character needs at most four UTF-8 bytes; never split a code point.
+        width = (SUMMARY_TEXT_TOKEN_BUDGET - 100) // 4
+        if estimate_text_tokens(text) + 100 <= SUMMARY_TEXT_TOKEN_BUDGET:
+            result.append(dict(chunk, text=text))
+            continue
+        for offset in range(0, len(text), width):
+            item = dict(chunk)
+            item["text"] = text[offset:offset + width]
+            item["chunk_id"] = f"{chunk.get('chunk_id', 'chunk')}:{offset}"
+            result.append(item)
+    return result
 
 
 def _summary_groups(chunks: list[dict]) -> list[list[dict]]:
-    """Create bounded, document-aware groups for hierarchical summarization."""
-    groups = []
-    current_group = []
-    current_characters = 0
-    current_document = None
+    groups, current = [], []
+    tokens, document = 0, None
     for chunk in chunks:
-        text = chunk.get("text", "").strip()
-        if not text:
-            continue
-        document_id = chunk.get("document_id")
-        starts_new_group = current_group and (
-            document_id != current_document
-            or len(current_group) >= SUMMARY_GROUP_MAX_CHUNKS
-            or current_characters + len(text) > SUMMARY_GROUP_MAX_CHARACTERS
-        )
-        if starts_new_group:
-            groups.append(current_group)
-            current_group = []
-            current_characters = 0
-        current_group.append(chunk)
-        current_characters += len(text)
-        current_document = document_id
-    if current_group:
-        groups.append(current_group)
+        cost = estimate_text_tokens(chunk["text"]) + 100
+        if current and (chunk.get("document_id") != document or
+                        len(current) >= SUMMARY_GROUP_MAX_CHUNKS or
+                        tokens + cost > SUMMARY_TEXT_TOKEN_BUDGET):
+            groups.append(current)
+            current, tokens = [], 0
+        current.append(chunk)
+        tokens += cost
+        document = chunk.get("document_id")
+    if current:
+        groups.append(current)
     return groups
-
-
-def _balanced_final_evidence(chunks: list[dict]) -> list[dict]:
-    """Bound final context while retaining representation across documents."""
-    by_document = {}
-    for chunk in chunks:
-        by_document.setdefault(chunk.get("document_id", ""), []).append(chunk)
-    selected = []
-    while len(selected) < FINAL_SUMMARY_MAX_EVIDENCE:
-        added = False
-        for document_chunks in by_document.values():
-            if document_chunks and len(selected) < FINAL_SUMMARY_MAX_EVIDENCE:
-                selected.append(document_chunks.pop(0))
-                added = True
-        if not added:
-            break
-    return selected
 
 
 def generate_executive_summary_from_chunks(
@@ -326,7 +335,7 @@ def generate_executive_summary_from_chunks(
     """Summarize an indexed scope directly, using hierarchy only when needed."""
     usable_chunks = []
     seen = set()
-    for chunk in chunks:
+    for chunk in _bounded_chunks(chunks):
         if not chunk.get("text", "").strip():
             continue
         key = (chunk.get("document_id"), chunk.get("chunk_id"))
@@ -339,42 +348,66 @@ def generate_executive_summary_from_chunks(
             "No summarizable document content is available."
         )
 
-    total_characters = sum(len(chunk["text"]) for chunk in usable_chunks)
+    total_characters = sum(estimate_text_tokens(chunk["text"]) + 100 for chunk in usable_chunks)
     if (
         len(usable_chunks) <= SMALL_SUMMARY_MAX_CHUNKS
-        and total_characters <= SMALL_SUMMARY_MAX_CHARACTERS
+        and total_characters <= SUMMARY_TEXT_TOKEN_BUDGET
     ):
         if progress_callback:
             progress_callback(1, 1, "Generating final summary")
         return generate_executive_summary(prepare_evidence(usable_chunks, "S"))
 
-    groups = _summary_groups(usable_chunks)
-    grounded_candidates = []
-    for group_number, group in enumerate(groups, start=1):
-        if progress_callback:
-            progress_callback(group_number, len(groups), "Summarizing chunk group")
-        partial = generate_executive_summary(prepare_evidence(group, "M"))
-        # Preserve the original chunks and metadata selected by each grounded map
-        # summary. Model-generated prose is never treated as citation evidence.
-        grounded_candidates.extend(partial.cited_evidence)
-
-    deduplicated_candidates = []
-    seen.clear()
-    for chunk in grounded_candidates:
-        key = (chunk.get("document_id"), chunk.get("chunk_id"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduplicated_candidates.append(chunk)
-    if not deduplicated_candidates:
-        raise NoSummarizableContentError(
-            "No summarizable document content is available."
-        )
-
-    final_chunks = _balanced_final_evidence(deduplicated_candidates)
-    if progress_callback:
-        progress_callback(len(groups), len(groups), "Generating final summary")
-    return generate_executive_summary(prepare_evidence(final_chunks, "S"))
+    # Map/reduce intermediate summaries. All node citations are expanded back
+    # to locally controlled original source chunks before reaching the UI.
+    nodes = usable_chunks
+    originals = {str(i): item for i, item in enumerate(usable_chunks)}
+    nodes = [dict(item, _source_ids=[str(i)]) for i, item in enumerate(nodes)]
+    level = 0
+    while True:
+        groups = _summary_groups(nodes)
+        reduced = []
+        for number, group in enumerate(groups, 1):
+            if progress_callback:
+                progress_callback(number, len(groups), f"Summarizing level {level + 1}")
+            evidence = prepare_evidence(group, "S")
+            partial = generate_executive_summary(evidence)
+            sources = []
+            for item in partial.cited_evidence:
+                for source_id in item["_source_ids"]:
+                    if source_id not in sources:
+                        sources.append(source_id)
+            if len(groups) == 1:
+                expanded = prepare_evidence([originals[i] for i in sources], "S")
+                source_map = {source_id: item["evidence_id"] for source_id, item in zip(sources, expanded)}
+                node_map = {item["evidence_id"]: item for item in evidence}
+                for points in partial.sections.values():
+                    for point in points:
+                        refs = []
+                        for node_id in point["evidence_ids"]:
+                            refs.extend(source_map[i] for i in node_map[node_id]["_source_ids"])
+                        point["evidence_ids"] = list(dict.fromkeys(refs))
+                return IntelligenceResult(partial.sections, expanded, partial.evidence_strength)
+            # Bound each intermediate node to ensure every reduce level contracts.
+            # Keep exact supporting source IDs only for the included points.
+            included, refs = [], []
+            used_bytes = 0
+            node_map = {item["evidence_id"]: item for item in evidence}
+            for title, points in partial.sections.items():
+                for point in points:
+                    line = title + ": " + point["text"]
+                    if used_bytes + estimate_text_tokens(line) > 1800:
+                        continue
+                    included.append(line)
+                    used_bytes += estimate_text_tokens(line)
+                    for node_id in point["evidence_ids"]:
+                        refs.extend(node_map[node_id]["_source_ids"])
+            if not included:
+                raise MalformedStructuredResponseError("Gemini returned no usable intermediate summary.")
+            reduced.append(dict(group[0], text="\n".join(included),
+                                chunk_id=f"reduce:{level}:{number}",
+                                document_id="summary-reduction", _source_ids=list(dict.fromkeys(refs))))
+        nodes = reduced
+        level += 1
 
 
 def generate_policy_comparison(
@@ -406,3 +439,62 @@ def generate_policy_comparison(
         COMPARISON_RETRY_OUTPUT_TOKENS,
     )
     return _validated_comparison_result(parsed, evidence)
+
+
+def summary_cache_key(chunks: list[dict]) -> str:
+    payload = {
+        "version": 3, "model": get_gemini_model(),
+        "settings": [SUMMARY_OUTPUT_TOKENS, SUMMARY_RETRY_OUTPUT_TOKENS,
+                     SUMMARY_INPUT_TOKEN_BUDGET, SUMMARY_GROUP_MAX_CHUNKS],
+        "sources": [{key: item.get(key) for key in
+                     ("document_id", "chunk_id", "page_number", "source_filename", "text")}
+                    for item in chunks],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def cached_executive_summary(chunks, cache, progress_callback=None):
+    """Store only complete successes in a caller-owned (Streamlit session) cache."""
+    key = summary_cache_key(chunks)
+    if key not in cache:
+        result = generate_executive_summary_from_chunks(chunks, progress_callback)
+        if not result.sections:
+            raise MalformedStructuredResponseError("Gemini returned no validated summary points.")
+        cache[key] = result
+    return cache[key]
+
+
+def local_extractive_summary(chunks: list[dict]) -> IntelligenceResult:
+    """Rank actual source sentences; no provider calls or invented prose."""
+    candidates = []
+    for item in prepare_evidence(_bounded_chunks(chunks), "L"):
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", item["text"]):
+            sentence = sentence.strip()
+            if len(sentence) >= 25 and any(c.isalnum() for c in sentence):
+                candidates.append((sentence, item))
+    if not candidates:
+        raise NoSummarizableContentError("No readable sentences were extracted. Try a text PDF or check OCR.")
+    frequencies = Counter(word.lower() for sentence, _ in candidates
+                          for word in re.findall(r"\b\w{4,}\b", sentence))
+    candidates.sort(key=lambda pair: sum(frequencies[w.lower()] for w in re.findall(r"\b\w{4,}\b", pair[0])) / max(1, len(pair[0])), reverse=True)
+    selected, seen = [], set()
+    # Round-robin document/page selection keeps extracts distributed across scope.
+    pages = {}
+    for sentence, item in candidates:
+        pages.setdefault((item.get("document_id"), item.get("page_number")), []).append((sentence, item))
+    while pages and len(selected) < 8:
+        for page in list(pages):
+            sentence, item = pages[page].pop(0)
+            if sentence not in seen:
+                seen.add(sentence)
+                selected.append((sentence, item))
+            if not pages[page]:
+                del pages[page]
+            if len(selected) >= 8:
+                break
+    evidence = {item["evidence_id"]: item for _, item in selected}
+    return IntelligenceResult(
+        {"Local extractive summary — source excerpts (not AI-generated)":
+         [{"text": sentence, "evidence_ids": [item["evidence_id"]]} for sentence, item in selected]},
+        list(evidence.values()), "Source excerpts; not assessed by Gemini",
+    )

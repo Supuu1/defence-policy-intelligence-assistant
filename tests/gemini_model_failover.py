@@ -69,14 +69,11 @@ def main():
     ).evidence_ids == ["E1"]
     assert primary.models.calls == [rag.PRIMARY_GEMINI_MODEL]
 
-    quota_fallback = Client(
-        [ProviderError(429, "RESOURCE_EXHAUSTED"), valid_response()]
-    )
-    assert generate(quota_fallback).parsed.answer
-    assert quota_fallback.models.calls == [
-        rag.PRIMARY_GEMINI_MODEL,
-        rag.FALLBACK_GEMINI_MODEL,
-    ]
+    # Minute rate limits retry the same configured model; never switch on quota.
+    rate_limited = Client([ProviderError(429, "per minute rate limit"), valid_response()])
+    with patch("src.rag_service.time.sleep"):
+        assert generate(rate_limited).parsed.answer
+    assert rate_limited.models.calls == [rag.PRIMARY_GEMINI_MODEL] * 2
 
     transient = Client(
         [
@@ -85,7 +82,7 @@ def main():
             valid_response(),
         ]
     )
-    with patch("src.rag_service.time.sleep") as sleep:
+    with patch("src.rag_service.time.sleep") as sleep, patch("src.rag_service.random.uniform", return_value=0):
         assert generate(transient).parsed.answer
     assert transient.models.calls == [
         rag.PRIMARY_GEMINI_MODEL,
@@ -94,23 +91,16 @@ def main():
     ]
     assert [call.args[0] for call in sleep.call_args_list] == [1.0, 2.0]
 
-    unavailable = Client(
-        [
-            ProviderError(429, "rate limit"),
-            ProviderError(429, "quota exhausted"),
-        ]
-    )
-    try:
-        generate(unavailable)
-        raise AssertionError("Both quota-exhausted models must fail safely")
-    except rag.GeminiRequestError as error:
-        assert str(error) == rag.API_LIMIT_MESSAGE
-    assert unavailable.models.calls == [
-        rag.PRIMARY_GEMINI_MODEL,
-        rag.FALLBACK_GEMINI_MODEL,
-    ]
-
-    print("Gemini primary, quota fallback, transient retry, and schema checks passed.")
+    unavailable = Client([ProviderError(429, "daily quota exhausted")])
+    with patch("src.rag_service.time.sleep") as sleep:
+        try:
+            generate(unavailable)
+            raise AssertionError("Daily quota must fail without retry or model switching")
+        except rag.GeminiRequestError as error:
+            assert "daily quota" in str(error)
+        sleep.assert_not_called()
+    assert unavailable.models.calls == [rag.PRIMARY_GEMINI_MODEL]
+    print("Gemini configured model, rate-limit retry, daily quota, and schema checks passed.")
 
 
 if __name__ == "__main__":

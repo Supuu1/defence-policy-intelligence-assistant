@@ -6,6 +6,6 @@ faiss-cpu>=1.9,<2
 numpy>=1.26,<3
 pytesseract>=0.3.13,<1
 pillow>=10,<13
-google-genai>=1,<2
+google-genai>=1.75,<2
 python-dotenv>=1,<2
 pydantic>=2,<3

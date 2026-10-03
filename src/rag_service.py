@@ -7,6 +7,10 @@ import logging
 import os
 import re
 import time
+import random
+import traceback
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
@@ -20,8 +24,7 @@ except ImportError:  # Let retrieval remain usable before optional setup is comp
 
 
 # One shared model policy is used by Q&A and every intelligence feature.
-PRIMARY_GEMINI_MODEL = "gemini-3.7-flash"
-FALLBACK_GEMINI_MODEL = "gemini-3.6-flash"
+PRIMARY_GEMINI_MODEL = "gemini-3.6-flash"
 TRANSIENT_RETRY_DELAYS_SECONDS = (1.0, 2.0)
 API_LIMIT_MESSAGE = (
     "AI generation is temporarily unavailable due to API limits. "
@@ -59,6 +62,22 @@ class MalformedStructuredResponseError(RAGServiceError):
     """Raised when Gemini output cannot be safely parsed and verified."""
 
 
+def get_gemini_model() -> str:
+    """Resolve deployment model override without a network request."""
+    load_dotenv()
+    value = os.getenv("GEMINI_MODEL", "").strip()
+    if not value:
+        try:
+            import streamlit as st
+            value = str(st.secrets.get("GEMINI_MODEL", "")).strip()
+        except Exception:
+            pass
+    value = value or PRIMARY_GEMINI_MODEL
+    if not re.fullmatch(r"(?:models/)?[a-zA-Z0-9._-]+", value):
+        raise RAGServiceError("Invalid GEMINI_MODEL setting; use a Gemini model ID.")
+    return value
+
+
 def _resolve_gemini_api_key() -> str | None:
     """Resolve Gemini credentials locally or from Streamlit Cloud secrets.
 
@@ -67,35 +86,49 @@ def _resolve_gemini_api_key() -> str | None:
     service modules and tests must still import cleanly outside Streamlit.
     """
     load_dotenv()
-    api_key = os.getenv("GEMINI_API_KEY")
-    if api_key:
-        return api_key
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        api_key = os.getenv(name, "").strip()
+        if api_key:
+            return api_key
 
     try:
         import streamlit as st
 
-        secret_key = st.secrets.get("GEMINI_API_KEY")
-        return str(secret_key) if secret_key else None
+        for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            secret_key = st.secrets.get(name)
+            if secret_key and str(secret_key).strip():
+                return str(secret_key).strip()
+        return None
     except Exception:
         # Missing/malformed deployment secrets must not prevent retrieval-only use.
         return None
 
 
-@lru_cache(maxsize=1)
 def get_gemini_client():
+    # Credentials are resolved for each caller; clients never cross credential scopes.
+    return _client_for_key(_resolve_gemini_api_key())
+
+
+@lru_cache(maxsize=8)
+def _client_for_key(resolved_api_key):
     """Create one official Gemini client shared by every generation feature."""
-    resolved_api_key = _resolve_gemini_api_key()
     if not resolved_api_key:
         raise MissingAPIKeyError("GEMINI_API_KEY not configured")
-    if genai is None or types is None:
-        raise RAGServiceError("google-genai package not installed")
+    if genai is None or types is None or not hasattr(types, "HttpRetryOptions"):
+        raise RAGServiceError("Install google-genai>=1.75,<2 from requirements.txt; the installed SDK is incompatible.")
     try:
         return genai.Client(
             api_key=resolved_api_key,
-            http_options=types.HttpOptions(timeout=45_000),
+            http_options=types.HttpOptions(
+                timeout=45_000, retry_options=types.HttpRetryOptions(attempts=1)
+            ),
         )
     except Exception as error:
-        raise RAGServiceError("client initialization failed") from error
+        log_gemini_exception(error, "client-initialization")
+        raise RAGServiceError("Gemini client initialization failed. Install requirements.txt and check API configuration.") from error
+
+
+get_gemini_client.cache_clear = _client_for_key.cache_clear
 
 
 def get_gemini_availability() -> tuple[bool, str]:
@@ -115,7 +148,7 @@ def generate_structured_content(
     response_schema,
     max_output_tokens: int,
 ):
-    """Generate structured output with bounded transient retry and quota failover."""
+    """Generate structured output with one explicit bounded retry policy."""
     client = get_gemini_client()
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
@@ -125,37 +158,24 @@ def generate_structured_content(
         response_schema=response_schema,
     )
 
+    model = get_gemini_model()
     try:
-        return _generate_with_transient_retry(
-            client, PRIMARY_GEMINI_MODEL, prompt, config
-        )
-    except Exception as primary_error:
-        if not _is_quota_error(primary_error):
-            raise GeminiRequestError(_friendly_llm_error(primary_error)) from primary_error
-
-        # A quota-exhausted model is not retried. Switch models exactly once.
+        return _generate_with_transient_retry(client, model, prompt, config)
+    except Exception as error:
+        category = _error_category(error)
         logger.warning(
-            "Gemini quota limit reached: model=%s action=try_fallback",
-            PRIMARY_GEMINI_MODEL,
+            "Gemini request failed: category=%s status=%s exception_type=%s model=%s input_bytes=%s",
+            category, _error_status_code(error), type(error).__name__, model,
+            len(prompt.encode("utf-8")),
         )
-        try:
-            return _generate_with_transient_retry(
-                client, FALLBACK_GEMINI_MODEL, prompt, config
-            )
-        except Exception as fallback_error:
-            if _is_quota_error(fallback_error):
-                logger.warning(
-                    "Gemini quota limit reached: model=%s action=no_more_models",
-                    FALLBACK_GEMINI_MODEL,
-                )
-                raise GeminiRequestError(API_LIMIT_MESSAGE) from fallback_error
-            raise GeminiRequestError(_friendly_llm_error(fallback_error)) from fallback_error
+        raise GeminiRequestError(_friendly_llm_error(error)) from error
 
 
 def _error_status_code(error: Exception) -> int | None:
     """Extract an HTTP-like status code without exposing provider error text."""
-    for attribute in ("code", "status_code"):
-        value = getattr(error, attribute, None)
+    values = [getattr(error, "code", None), getattr(error, "status_code", None),
+              getattr(getattr(error, "response", None), "status_code", None)]
+    for value in values:
         try:
             return int(value)
         except (TypeError, ValueError):
@@ -167,48 +187,142 @@ def _error_status_code(error: Exception) -> int | None:
 
 def _is_quota_error(error: Exception) -> bool:
     """Recognize Gemini quota/rate-limit failures across SDK error variants."""
-    if _error_status_code(error) == 429:
-        return True
+    status = _error_status_code(error)
+    if status is not None:
+        return status == 429
     classification = f"{type(error).__name__} {error}".lower()
     return any(
         marker in classification
-        for marker in ("resource_exhausted", "resource exhausted", "rate limit", "quota")
+        for marker in ("resource_exhausted", "resource exhausted", "rate limit", "quota exceeded", "quota exhausted")
     )
+
+
+# Preserve only recognized provider diagnostic phrases. Unknown free-form text
+# may contain a complete request, key, headers, or PDF content and is withheld.
+_SAFE_PROVIDER_PHRASES = (
+    r"API[_ ]KEY[_ ]INVALID", r"API[_ ]KEY[_ ]EXPIRED", r"API[_ ]KEY[_ ]SERVICE[_ ]BLOCKED",
+    r"API key not valid", r"invalid API key", r"API key expired",
+    r"UNAUTHENTICATED", r"PERMISSION[_ ]DENIED", r"permission denied",
+    r"ACCESS_TOKEN_TYPE_UNSUPPORTED", r"SERVICE_DISABLED", r"BILLING_DISABLED",
+    r"NOT[_ ]FOUND", r"model not found", r"unsupported model",
+    r"not supported for generateContent", r"INVALID[_ ]ARGUMENT",
+    r"RESOURCE[_ ]EXHAUSTED", r"quota exceeded", r"quota exhausted",
+    r"rate limit", r"daily quota", r"per day", r"per minute",
+    r"UNAVAILABLE", r"service unavailable", r"temporarily unavailable",
+    r"INTERNAL", r"internal server error", r"DEADLINE[_ ]EXCEEDED",
+    r"timed out", r"timeout", r"connection refused", r"connection reset",
+    r"name or service not known", r"name resolution", r"network is unreachable",
+    r"certificate verify failed", r"SSL", r"TLS", r"model is overloaded",
+    r"model is busy", r"model is at capacity", r"high demand", r"try again later",
+)
+
+
+def sanitized_error_message(error: Exception) -> str:
+    """Keep diagnostic fragments from the original; redact all other content."""
+    raw = str(error)
+    phrases = []
+    for pattern in _SAFE_PROVIDER_PHRASES:
+        match = re.search(r"(?<!\w)(?:" + pattern + r")(?!\w)", raw, re.IGNORECASE)
+        if match and match.group(0).lower() not in {x.lower() for x in phrases}:
+            phrases.append(match.group(0))
+    return "; ".join(phrases) + "; [remaining provider details redacted]" if phrases else "[provider message redacted: no allowlisted diagnostic phrase]"
+
+
+def sanitized_error_traceback(error: Exception) -> str:
+    """Original exception/chain frames, with no locals, source lines or payloads."""
+    lines, seen = [], set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        lines.append("Traceback (sanitized; source lines and locals omitted):")
+        for frame, line_number in traceback.walk_tb(current.__traceback__):
+            # Use frame locations only; never format_exception/format_exc,
+            # whose exception text and source lines may contain credentials.
+            filename = os.path.basename(frame.f_code.co_filename)
+            lines.append(f'  File "{filename}", line {line_number}, in {frame.f_code.co_name}')
+        lines.append(f"{type(current).__name__}: {sanitized_error_message(current)}")
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+        if current is not None:
+            lines.append("Caused by/context:")
+    return "\n".join(lines)
+
+
+def log_gemini_exception(error: Exception, model: str, attempt=None):
+    logger.warning(
+        "Gemini attempt failed: category=%s status=%s exception_type=%s model=%s attempt=%s message=%s\n%s",
+        _error_category(error), _error_status_code(error), type(error).__name__,
+        model, attempt, sanitized_error_message(error), sanitized_error_traceback(error),
+    )
+
+
+def _error_category(error: Exception) -> str:
+    status = _error_status_code(error)
+    # Inspect provider details only in memory; never log messages or payloads.
+    detail = str(error).lower()
+    if status in {401, 403} or any(marker in detail for marker in (
+        "api_key_invalid", "api_key_expired", "api_key_service_blocked",
+        "api key not valid", "invalid api key", "api key expired",
+    )):
+        return "authentication"
+    if status == 404 or (status == 400 and any(marker in detail for marker in (
+        "model not found", "unsupported model", "not supported for generatecontent",
+        "invalid model", "unexpected model name", "invalid model name",
+    ))):
+        return "model_configuration"
+    if _is_quota_error(error):
+        if (any(x in detail for x in ("perday", "per_day", "per day", "daily", "limit: 0", '"limit": 0'))
+                or re.search(r"quotavalue['\"]?\s*:\s*['\"]?0\b", detail)):
+            return "quota_exhausted"
+        return "rate_limit"
+    if status == 400 or isinstance(error, (ValueError, TypeError)):
+        return "invalid_input"
+    if status == 408:
+        return "timeout"
+    if isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower():
+        return "timeout"
+    if isinstance(error, ConnectionError) or type(error).__name__ in {"ConnectError", "NetworkError", "RemoteProtocolError"}:
+        return "network"
+    if status in {500, 502, 503, 504}:
+        return "service"
+    return "unknown"
 
 
 def _is_transient_error(error: Exception) -> bool:
-    """Return whether retrying the same model is appropriate."""
-    status_code = _error_status_code(error)
-    if status_code is not None:
-        return status_code in {500, 502, 503, 504}
-    classification = f"{type(error).__name__} {error}".lower()
-    return any(
-        marker in classification
-        for marker in ("service unavailable", "temporarily unavailable", "unavailable")
-    )
+    return _error_category(error) in {"rate_limit", "timeout", "network", "service"}
+
+
+def _retry_after(error: Exception) -> float:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", {}) or getattr(error, "headers", {}) or {}
+    value = headers.get("Retry-After") or headers.get("retry-after")
+    if value:
+        try:
+            return max(0.0, float(value))
+        except (ValueError, TypeError):
+            try:
+                return max(0.0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+            except (ValueError, TypeError):
+                pass
+    details = getattr(error, "details", None)
+    if details is None:
+        details = getattr(error, "response_json", {})
+    match = re.search(r"retryDelay['\"]?\s*:\s*['\"]([0-9.]+)s", str(details))
+    return float(match.group(1)) if match else 0.0
 
 
 def _generate_with_transient_retry(client, model: str, prompt: str, config):
-    """Call one model, backing off only for transient service failures."""
     for attempt in range(len(TRANSIENT_RETRY_DELAYS_SECONDS) + 1):
         try:
-            return client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=config,
-            )
+            return client.models.generate_content(model=model, contents=prompt, config=config)
         except Exception as error:
-            if _is_quota_error(error) or not _is_transient_error(error):
+            log_gemini_exception(error, model, attempt + 1)
+            if not _is_transient_error(error) or attempt >= len(TRANSIENT_RETRY_DELAYS_SECONDS):
                 raise
-            if attempt >= len(TRANSIENT_RETRY_DELAYS_SECONDS):
+            delay = max(TRANSIENT_RETRY_DELAYS_SECONDS[attempt] + random.uniform(0, 0.5), _retry_after(error))
+            # Do not retry early if the server requests a wait beyond our budget.
+            if delay > 30:
                 raise
-            delay = TRANSIENT_RETRY_DELAYS_SECONDS[attempt]
-            logger.warning(
-                "Gemini transient failure: model=%s retry=%s delay_seconds=%.1f",
-                model,
-                attempt + 1,
-                delay,
-            )
+            logger.info("Gemini retry scheduled: attempt=%s delay_seconds=%.2f", attempt + 2, delay)
             time.sleep(delay)
 
 
@@ -282,6 +396,16 @@ def _recover_partial_grounded_response(text: str):
     )
 
 
+def _validate_response_status(response):
+    feedback = getattr(response, "prompt_feedback", None)
+    block = getattr(feedback, "block_reason", None)
+    reason = _response_finish_reason(response).upper()
+    if (block and "UNSPECIFIED" not in str(block)) or any(x in reason for x in ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED", "SPII")):
+        raise MalformedStructuredResponseError("Gemini blocked this source for safety/content restrictions. Review the selected document; no automatic retry was made.")
+    if getattr(response, "parsed", None) is None and not (getattr(response, "text", "") or "").strip() and not _finished_at_token_limit(response):
+        raise MalformedStructuredResponseError("Gemini returned an empty response. Use the local extractive summary or retry later.")
+
+
 def parse_structured_response(response, response_schema):
     """Prefer SDK-parsed schema output, with a defensive JSON-text fallback."""
     try:
@@ -324,6 +448,7 @@ def generate_structured_response(
         response_schema,
         max_output_tokens,
     )
+    _validate_response_status(response)
     finish_reason = _response_finish_reason(response)
     logger.info(
         "Gemini generation: task=%s output_token_budget=%s finish_reason=%s retry_performed=no",
@@ -370,6 +495,7 @@ def generate_structured_response(
         response_schema,
         resolved_retry_tokens,
     )
+    _validate_response_status(retry_response)
     retry_finish_reason = _response_finish_reason(retry_response)
     retry_log = logger.warning if _finished_at_token_limit(retry_response) else logger.info
     retry_log(
@@ -579,21 +705,17 @@ def build_verified_sources(
 
 def _friendly_llm_error(error: Exception) -> str:
     """Translate provider errors without exposing request or credential details."""
-    error_name = type(error).__name__
-    status_code = _error_status_code(error)
-    if error_name in {"ConnectTimeout", "ReadTimeout", "TimeoutException"}:
-        return "The Gemini request timed out. Please try again."
-    if _is_quota_error(error):
-        return API_LIMIT_MESSAGE
-    if status_code in {400, 401, 403}:
-        return "Gemini rejected the API key or request. Check GEMINI_API_KEY."
-    if status_code == 404:
-        return "The configured Gemini model is currently unavailable."
-    if error_name in {"ConnectError", "NetworkError"}:
-        return "The application could not connect to Gemini. Check the network connection."
-    if status_code in {500, 502, 503, 504}:
-        return "The Gemini service is temporarily unavailable. Please try again later."
-    return "Grounded response generation failed. Retrieved evidence is still available."
+    category = _error_category(error)
+    return {
+        "authentication": "Gemini rejected the API key or its permissions. Check GEMINI_API_KEY and project access.",
+        "model_configuration": "The configured Gemini model is unavailable for this API key. Check GEMINI_MODEL in AI Studio.",
+        "quota_exhausted": "Gemini daily quota is exhausted or the project has no quota. Check AI Studio usage/billing and wait for quota reset.",
+        "rate_limit": API_LIMIT_MESSAGE + " Wait before retrying; check AI Studio rate limits.",
+        "invalid_input": "Gemini rejected the request parameters or input. Check SDK compatibility and document extraction.",
+        "timeout": "The Gemini request timed out after bounded retries. Try again later or use the local extractive summary.",
+        "network": "The application could not connect to Gemini after bounded retries. Check deployment network access.",
+        "service": "The Gemini service is temporarily unavailable after bounded retries. A local extractive summary is available.",
+    }.get(category, "Gemini generation failed unexpectedly. Check sanitized server diagnostics for exception type and status.")
 
 
 def generate_grounded_answer(

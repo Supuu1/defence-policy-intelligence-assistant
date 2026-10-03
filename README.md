@@ -98,8 +98,8 @@ pip install -r requirements.txt
 ## Gemini configuration
 
 The application uses Google's official `google-genai` SDK with
-`gemini-3.7-flash` as the primary generation model and `gemini-3.6-flash` as a
-quota fallback. Create an API key in
+`gemini-3.6-flash` as the default generation model. Set `GEMINI_MODEL` to override
+it with a model available to your project. Quota errors never switch models. Create an API key in
 [Google AI Studio](https://aistudio.google.com/app/apikey), then copy the
 environment template and add the key locally:
 
@@ -258,3 +258,152 @@ new Gemini request.
 - Optional multilingual OCR and entity patterns
 - Structured observability and configurable operational limits for hosted use
 - A reproducible dependency lock for tagged releases
+
+
+## Executive Summary deployment and diagnostics
+
+Install the updated `requirements.txt` (the retry controls require
+`google-genai>=1.75,<2`) and reboot the Streamlit deployment. In Streamlit Cloud,
+set these top-level entries in **App settings → Secrets**:
+
+```toml
+GEMINI_API_KEY = "YOUR_EXISTING_VALID_AI_STUDIO_KEY"
+GEMINI_MODEL = "gemini-3.6-flash" # verified; also the application default
+```
+
+Set `GEMINI_MODEL` explicitly to `gemini-3.6-flash`. Live checks with the local
+application key and SDK found that `3.7` and `3.8` returned ServerError HTTP 503
+for a minimal Reply OK request, while `3.6` passed that request and a synthetic
+PDF summary. This verifies a working configuration at test time, not permanent
+availability or the deployed account's state. The original `3.7` and selected
+`3.6` models are listed in Google's [model catalog](https://ai.google.dev/gemini-api/docs/models).
+Availability for a particular project must be checked with that project's key.
+`GOOGLE_API_KEY` is accepted as an alias. This application resolves nonblank
+`GEMINI_API_KEY` before `GOOGLE_API_KEY`, environment before Streamlit secrets;
+a stale environment key can therefore override your secrets. Local `.env` is
+loaded without replacing existing environment variables. Client reuse is scoped
+to the resolved key; summary results are confined to each Streamlit session.
+The configuration indicator checks client setup only, not live service health.
+
+Summary requests use a 45-second per-attempt timeout, at most three attempts,
+exponential backoff plus jitter, and server Retry-After/RetryInfo delays. If the
+server asks for more than 30 seconds, the app stops instead of retrying early.
+Daily/zero quota, authentication, permissions, unknown failures, invalid input,
+and unavailable models are not automatically retried. SDK retries are disabled.
+Malformed structured output/token truncation gets one bounded repair request;
+safety blocks and empty responses do not. Rate limits, service errors, network
+failures, and timeouts receive bounded retries. See Google's
+[error guidance](https://ai.google.dev/gemini-api/docs/troubleshooting) and
+[SDK reference](https://googleapis.github.io/python-genai/).
+
+Server diagnostics include category, HTTP status, original exception class,
+allowlisted fragments of its original error message, model, attempt, input byte
+count, and traceback frames (including chained exceptions). Unknown message text
+is redacted. Tracebacks omit locals, source lines and full paths; raw provider
+payloads, headers, keys, prompts and document text are never logged. Standard
+`logger.exception`/`exc_info` formatting is deliberately avoided because it can
+print secret-bearing exception strings or source lines. The old quoted "temporarily unavailable" message was emitted
+only for 500/502/503/504 in this checkout, but it discarded the status and type
+from summary logs. Without the deployed exception/logs, its precise cause is
+unverified. After redeployment, look for `Gemini attempt failed` or
+`Gemini request failed` in Streamlit server logs to identify the actual failure.
+
+The selected scope is filtered before hashing or generation. Successful summaries
+are keyed by source text/metadata, model, and versioned summary settings in session
+state. Normal reruns reuse the displayed summary; **Regenerate Summary** explicitly
+requests a new generation. Failed requests never enter the success cache. Local
+fallback excerpts are stored separately and labeled in both the UI and exported
+report; they never call another provider. Cache clearing removes both forms.
+
+Large extracted chunks are split while preserving page metadata. A conservative
+UTF-8 byte bound estimates text tokens, with an instruction/schema reserve, so
+non-English text does not rely on an English characters-per-token heuristic.
+Hierarchical map/reduce summaries resolve intermediate citations to original
+source chunks. Each reduce stage is bounded and concise; this is an overview,
+not an exhaustive list of every provision. Local fallback ranks verbatim source
+sentences and distributes excerpts over available source pages. Empty/unreadable
+extraction is rejected before any summary generation; inspect native text/OCR.
+
+Offline focused checks (no live API key required):
+
+```bash
+python tests/summary_reliability.py
+python tests/gemini_model_failover.py
+python tests/shared_gemini_client.py
+python tests/structured_response_parsing.py
+python tests/token_budget_regression.py
+python tests/intelligence_features.py
+python tests/production_stabilization.py
+```
+
+## Reproducing the model failure and deploying the fix
+
+Run this command with the same configuration as the app (it performs real API
+requests and consumes a small amount of quota):
+
+```bash
+python scripts/verify_gemini.py --pdf-smoke
+```
+
+The diagnostic uses the application's credential/model resolver, cached SDK
+client, API endpoint and timeout. It checks `models.list` for `generateContent`,
+then sends a single minimal `Reply OK` request with no application retry/fallback.
+Only after that succeeds does `--pdf-smoke` create a synthetic one-page PDF,
+extract its text, summarize it and verify references. It prints pass/fail and
+sanitized exception diagnostics, never headers, keys or source/response content.
+Do not enable SDK/HTTP debug logging when investigating a real uploaded PDF.
+
+Latest live results in this workspace on 2026-10-03, google-genai 1.75.0:
+
+| Model | Listed with generateContent | Reply OK | Synthetic PDF summary |
+| --- | --- | --- | --- |
+| gemini-3.7-flash | Yes | HTTP 503 initially; later control passed | Skipped after initial failed prerequisite |
+| gemini-3.8-flash | Yes | ServerError, HTTP 503 | Skipped after failed prerequisite |
+| gemini-3.6-flash | Yes | Passed twice | Passed twice: 5 then 4 sections, 1 page reference |
+
+These checks used locally configured credentials, not the deployed Streamlit
+runtime. The earlier synthetic summary on `3.7` had succeeded, so the evidence
+supports a current generation failure, not an invalid model ID or a permanent
+outage. A later `3.6` PDF request reported `ServerError`, HTTP 503,
+`UNAVAILABLE`, and "high demand" in the sanitized diagnostics, then succeeded
+within the bounded retry budget. A final minimal `3.7` control also passed.
+These observations establish intermittent capacity/service failures; they do
+not establish the precise backend cause of the earlier `3.7`/`3.8` failures.
+Changing the default to verified `3.6` is a configuration mitigation, not a
+permanent cure for provider capacity. The previous committed retry statement logged no exception and also classified failures from
+the word "unavailable" alone. That classifier now requires appropriate error
+status/type; authentication, model configuration and daily/zero quota never retry.
+
+The selected and locally verified deployment setting is:
+
+```toml
+GEMINI_MODEL = "gemini-3.6-flash"
+```
+
+Keep your existing valid `GEMINI_API_KEY`. Local `.env` and `.env.example` have
+been updated to the same model; `.env` remains ignored and must not be committed.
+A deployed environment `GEMINI_MODEL` takes precedence over Streamlit Secrets,
+so update/remove any stale environment override too. Model resolution is nonblank
+environment (including local dotenv), then top-level Streamlit Secrets, then the
+application default. `models.list` support is not a service-health guarantee;
+the minimal generation request is the actual availability check.
+
+Deployment targets `origin/main`. Once the prepared local main commit is pushed,
+Streamlit Cloud should rebuild from the changed requirements. Save the model
+setting above in **App settings → Secrets**, then **Reboot app**. Confirm the
+startup code is the new revision and test a selected PDF. If it fails, collect
+the sanitized `Gemini attempt failed` event with message/status/traceback. The
+old `Gemini transient failure` line means the old revision is still running.
+
+The focused summary and diagnostic suites contain 20 offline tests, including
+original/chain traceback redaction, exception-message confidentiality, model
+resolution precedence, unsupported-model classification, minimal-probe ordering,
+and prohibition of PDF calls after a failed minimal prerequisite. The existing
+nine regression scripts and Streamlit startup/ordinary rerun smoke checks passed.
+
+Additional offline checks:
+
+```bash
+python tests/verify_gemini.py
+python tests/summary_reliability.py
+```

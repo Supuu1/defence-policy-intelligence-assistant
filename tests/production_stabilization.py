@@ -38,7 +38,7 @@ def main():
     assert [item["filename"] for item in duplicates] == ["renamed-copy.pdf"]
     assert sum(len(item["chunks"]) for item in unique) == 2
 
-    assert _friendly_llm_error(ProviderError(429)) == API_LIMIT_MESSAGE
+    assert API_LIMIT_MESSAGE in _friendly_llm_error(ProviderError(429))
     assert "api key" in _friendly_llm_error(ProviderError(401)).lower()
     assert "model" in _friendly_llm_error(ProviderError(404)).lower()
     assert "temporarily unavailable" in _friendly_llm_error(ProviderError(503)).lower()
